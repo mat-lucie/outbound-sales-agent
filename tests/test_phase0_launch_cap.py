@@ -15,7 +15,6 @@ import json
 from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
-from clients.google_sheets import profiles_per_launch
 from models.pipeline import PipelineStage
 from workflows.daily_check import PHASE0_MAX_PROFILES_PER_LAUNCH
 
@@ -80,7 +79,8 @@ def _run_phase0(entries, pb, monkeypatch, *, backend="sales_nav"):
     )
     sheet_calls: list[list[dict]] = []
 
-    def _capture_sheet(rows, columns=None):
+    def _capture_sheet(rows, columns=None, include_header=True):
+        assert include_header is False
         sheet_calls.append(rows)
         return "https://s"
 
@@ -126,7 +126,7 @@ def test_oversized_stale_set_launches_capped_batch(monkeypatch, capsys):
     # Launch arg is batch + the sheet header line PB counts as a processable
     # row (clients.google_sheets.profiles_per_launch); the submitted sheet
     # batch itself stays at the cap.
-    assert args["numberOfProfilesPerLaunch"] == profiles_per_launch(
+    assert args["numberOfProfilesPerLaunch"] == (
         PHASE0_MAX_PROFILES_PER_LAUNCH
     )
     assert len(sheet_calls) == 1
@@ -222,7 +222,7 @@ def test_batch_at_or_under_cap_is_untrimmed(monkeypatch, capsys):
     result, _mock_rc, sheet_calls, _mock_esc = _run_phase0(entries, pb, monkeypatch)
 
     args = pb.launch_agent.call_args[0][1]
-    assert args["numberOfProfilesPerLaunch"] == profiles_per_launch(
+    assert args["numberOfProfilesPerLaunch"] == (
         PHASE0_MAX_PROFILES_PER_LAUNCH
     )
     assert len(sheet_calls[0]) == PHASE0_MAX_PROFILES_PER_LAUNCH

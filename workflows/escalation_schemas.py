@@ -77,6 +77,7 @@ ESCALATION_TYPES: tuple[str, ...] = (
     # ---- Salesman-daily (§4.2) ----
     "pb_inmail_dead_end",
     "pb_silent_no_op",
+    "pb_invite_unconfirmed",
     "hot_lead_positive_reply",
     "manual_reply_unclassified",
     "ambiguous_reply_match",
@@ -596,6 +597,15 @@ class PBSilentNoOpPayload(TypedDict):
     next_day_drift_key: str
     experiment_id: NotRequired[str | None]
     skipped_urls: NotRequired[list[str]]
+
+
+class PBInviteUnconfirmedPayload(TypedDict):
+    """Invite candidate held until its exact provider state is verified."""
+    container_id: str
+    profile_url: str
+    record_id: str
+    entry_id: str
+    hold_until: str
 
 
 class PbInmailDeadEndPayload(TypedDict):
@@ -1371,6 +1381,7 @@ ESCALATION_SCHEMAS: dict[str, type] = {
     "weekly_brain_proposal": WeeklyBrainProposalPayload,
     "cost_ceiling_breached": CostCeilingBreachedPayload,
     "pb_silent_no_op": PBSilentNoOpPayload,
+    "pb_invite_unconfirmed": PBInviteUnconfirmedPayload,
     "pb_inmail_dead_end": PbInmailDeadEndPayload,
     "pipeline_starvation": PipelineStarvationPayload,
     "pipeline_starvation_check_failed": PipelineStarvationCheckFailedPayload,

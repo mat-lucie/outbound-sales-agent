@@ -127,7 +127,7 @@ class TestNoDmProspects:
         with patch("workflows.detect_responses.AttioClient.parse_entry", side_effect=lambda e: e), \
              patch("workflows.detect_responses.RecordCache") as MockCache:
             mock_cache_instance = MagicMock()
-            mock_cache_instance.get.return_value = ("Test User", "TestCo", "https://li.com/in/test", "", "")
+            mock_cache_instance.get.return_value = ("Test User", "TestCo", "https://linkedin.com/in/test", "", "")
             MockCache.return_value = mock_cache_instance
 
             result = detect_responses(attio, pb, inbox_scraper_id="scraper-123")
@@ -150,7 +150,7 @@ class TestIdempotency:
         with patch("workflows.detect_responses.AttioClient.parse_entry", side_effect=lambda e: e), \
              patch("workflows.detect_responses.RecordCache") as MockCache:
             mock_cache_instance = MagicMock()
-            mock_cache_instance.get.return_value = ("Carlos Lopez", "Acme", "https://li.com/in/carlos", "", "")
+            mock_cache_instance.get.return_value = ("Carlos Lopez", "Acme", "https://linkedin.com/in/carlos", "", "")
             MockCache.return_value = mock_cache_instance
 
             result = detect_responses(attio, pb, inbox_scraper_id="scraper-123")
@@ -169,7 +169,7 @@ class TestIdempotency:
         with patch("workflows.detect_responses.AttioClient.parse_entry", side_effect=lambda e: e), \
              patch("workflows.detect_responses.RecordCache") as MockCache:
             mock_cache_instance = MagicMock()
-            mock_cache_instance.get.return_value = ("Maria Gomez", "Corp", "https://li.com/in/maria", "", "")
+            mock_cache_instance.get.return_value = ("Maria Gomez", "Corp", "https://linkedin.com/in/maria", "", "")
             MockCache.return_value = mock_cache_instance
 
             result = detect_responses(attio, pb, inbox_scraper_id="scraper-123")
@@ -190,7 +190,7 @@ class TestClassificationRouting:
         attio.query_list_entries.return_value = [entry]
 
         csv_content = _make_sn_csv({
-            "participantProfileUrl": "https://linkedin.com/sales/people/ACw123",
+            "participantProfileUrl": "https://linkedin.com/in/test",
             "participantFullName": prospect_name,
             "isLastMessageFromMe": "false",
             "lastMessageBody": message_body,
@@ -202,7 +202,7 @@ class TestClassificationRouting:
              patch("workflows.detect_responses._pb_session_args", return_value={}), \
              patch("workflows.detect_responses.RecordCache") as MockCache:
             mock_cache_instance = MagicMock()
-            mock_cache_instance.get.return_value = (prospect_name, "TestCo", "https://li.com/in/test", "", "")
+            mock_cache_instance.get.return_value = (prospect_name, "TestCo", "https://linkedin.com/in/test", "", "")
             MockCache.return_value = mock_cache_instance
 
             result = detect_responses(attio, pb, inbox_scraper_id="scraper-123")
@@ -267,7 +267,7 @@ class TestFromMeFiltering:
         attio.query_list_entries.return_value = [entry]
 
         csv_content = _make_sn_csv({
-            "participantProfileUrl": "https://linkedin.com/sales/people/ACw123",
+            "participantProfileUrl": "https://linkedin.com/in/vanessa",
             "participantFullName": "Vanessa Solis",
             "isLastMessageFromMe": last_message_from_me,
             "lastMessageBody": "Gracias por tu respuesta, saludos!",
@@ -280,7 +280,7 @@ class TestFromMeFiltering:
              patch("workflows.detect_responses._pb_session_args", return_value={}), \
              patch("workflows.detect_responses.RecordCache") as MockCache:
             mock_cache_instance = MagicMock()
-            mock_cache_instance.get.return_value = ("Vanessa Solis", "Acme", "https://li.com/in/vanessa", "", "")
+            mock_cache_instance.get.return_value = ("Vanessa Solis", "Acme", "https://linkedin.com/in/vanessa", "", "")
             MockCache.return_value = mock_cache_instance
 
             result = detect_responses(attio, pb, inbox_scraper_id="scraper-123")
@@ -365,7 +365,7 @@ class TestNameMatching:
         attio.query_list_entries.return_value = [entry]
 
         csv_content = _make_sn_csv({
-            "participantProfileUrl": "https://linkedin.com/sales/people/ACw999",
+            "participantProfileUrl": "https://linkedin.com/in/carlos",
             "participantFullName": "Unknown Person",
             "isLastMessageFromMe": "false",
             "lastMessageBody": "Interested!",
@@ -377,7 +377,7 @@ class TestNameMatching:
              patch("workflows.detect_responses._pb_session_args", return_value={}), \
              patch("workflows.detect_responses.RecordCache") as MockCache:
             mock_cache_instance = MagicMock()
-            mock_cache_instance.get.return_value = ("Known User", "KnownCo", "https://li.com/in/known", "", "")
+            mock_cache_instance.get.return_value = ("Known User", "KnownCo", "https://linkedin.com/in/known", "", "")
             MockCache.return_value = mock_cache_instance
 
             result = detect_responses(attio, pb, inbox_scraper_id="scraper-123")
@@ -394,7 +394,7 @@ class TestNameMatching:
         attio.query_list_entries.return_value = [entry]
 
         csv_content = _make_sn_csv({
-            "participantProfileUrl": "https://linkedin.com/sales/people/ACw456",
+            "participantProfileUrl": "https://linkedin.com/in/carlos",
             "participantFullName": "CARLOS LOPEZ",  # uppercase in CSV
             "isLastMessageFromMe": "false",
             "lastMessageBody": "Interested! Let's talk.",
@@ -407,7 +407,7 @@ class TestNameMatching:
              patch("workflows.detect_responses.RecordCache") as MockCache:
             mock_cache_instance = MagicMock()
             # Attio stores as mixed case
-            mock_cache_instance.get.return_value = ("Carlos Lopez", "Acme", "https://li.com/in/carlos", "", "")
+            mock_cache_instance.get.return_value = ("Carlos Lopez", "Acme", "https://linkedin.com/in/carlos", "", "")
             MockCache.return_value = mock_cache_instance
 
             result = detect_responses(attio, pb, inbox_scraper_id="scraper-123")
@@ -426,7 +426,7 @@ class TestNameCollision:
     one of them and left them stuck in DM stage indefinitely.
     """
 
-    def test_collision_updates_both_entries(self):
+    def test_collision_updates_only_verified_profile(self):
         attio = MagicMock()
         pb = MagicMock()
 
@@ -436,7 +436,7 @@ class TestNameCollision:
         attio.query_list_entries.return_value = [entry_a, entry_b]
 
         csv_content = _make_sn_csv({
-            "participantProfileUrl": "https://linkedin.com/sales/people/dup",
+            "participantProfileUrl": "https://linkedin.com/in/carlos-cemex",
             "participantFullName": "Carlos Ejemplo",
             "isLastMessageFromMe": "false",
             "lastMessageBody": "No me interesa, gracias.",
@@ -446,8 +446,8 @@ class TestNameCollision:
 
         def cache_side_effect(rid):
             if rid == "r-collide-a":
-                return ("Carlos Ejemplo", "Cementra", "https://li.com/in/carlos-ejemplo", "", "")
-            return ("Carlos Ejemplo", "Bimbo", "https://li.com/in/carlos-bimbo", "", "")
+                return ("Carlos Ejemplo", "Cementra", "https://linkedin.com/in/carlos-cemex", "", "")
+            return ("Carlos Ejemplo", "Bimbo", "https://linkedin.com/in/carlos-other-company", "", "")
 
         with patch("workflows.detect_responses.AttioClient.parse_entry", side_effect=lambda e: e), \
              patch("workflows.detect_responses._pb_session_args", return_value={}), \
@@ -460,12 +460,12 @@ class TestNameCollision:
 
         # Detected once (one inbox row matched).
         assert result["detected"] == 1
-        # But BOTH entries got updated — neither silently lost.
-        assert attio.update_list_entry.call_count == 2
+        # Only the verified profile is updated.
+        assert attio.update_list_entry.call_count == 1
         updated_entry_ids = {
             call.kwargs.get("entry_id") for call in attio.update_list_entry.call_args_list
         }
-        assert updated_entry_ids == {"e-collide-a", "e-collide-b"}
+        assert updated_entry_ids == {"e-collide-a"}
 
     def test_collision_with_one_terminal_entry_only_updates_actionable(self):
         """If one of the colliding entries is already in a terminal stage
@@ -480,7 +480,7 @@ class TestNameCollision:
         attio.query_list_entries.return_value = [entry_actionable, entry_terminal]
 
         csv_content = _make_sn_csv({
-            "participantProfileUrl": "https://linkedin.com/sales/people/x",
+            "participantProfileUrl": "https://linkedin.com/in/r-act",
             "participantFullName": "Maria Gonzalez",
             "isLastMessageFromMe": "false",
             "lastMessageBody": "Sounds good, let's talk.",
@@ -489,7 +489,7 @@ class TestNameCollision:
         pb.download_result_csv.return_value = csv_content
 
         def cache_side_effect(rid):
-            return ("Maria Gonzalez", "AcmeCo", f"https://li.com/{rid}", "", "")
+            return ("Maria Gonzalez", "AcmeCo", f"https://linkedin.com/in/{rid}", "", "")
 
         with patch("workflows.detect_responses.AttioClient.parse_entry", side_effect=lambda e: e), \
              patch("workflows.detect_responses._pb_session_args", return_value={}), \
@@ -514,6 +514,7 @@ class TestCadenceDriftDetector:
         """Responded prospect with dm_step=1 but thread shows 3 outbound from us → drift."""
         from workflows.detect_responses import _detect_cadence_drift
         threads = [{
+            "participantProfileUrl": "https://linkedin.com/in/cadence-test",
             "participantFullName": "Alberto Cavia",
             "totalMessageCount": "4",
             "isLastMessageFromMe": "true",
@@ -523,6 +524,7 @@ class TestCadenceDriftDetector:
                 "stage": PipelineStage.RESPONDED.value,
                 "dm_step": 1,
                 "company_name": "Conagra",
+                "linkedin_url": "https://linkedin.com/in/cadence-test",
                 "record_id": "r1",
             }],
         }
@@ -535,6 +537,7 @@ class TestCadenceDriftDetector:
         """Responded prospect with dm_step matching thread → no drift."""
         from workflows.detect_responses import _detect_cadence_drift
         threads = [{
+            "participantProfileUrl": "https://linkedin.com/in/cadence-test",
             "participantFullName": "Bob Bob",
             "totalMessageCount": "2",
             "isLastMessageFromMe": "false",
@@ -544,6 +547,7 @@ class TestCadenceDriftDetector:
                 "stage": PipelineStage.RESPONDED.value,
                 "dm_step": 1,
                 "company_name": "X",
+                "linkedin_url": "https://linkedin.com/in/cadence-test",
                 "record_id": "r2",
             }],
         }
@@ -554,6 +558,7 @@ class TestCadenceDriftDetector:
         """NOT_INTERESTED stays terminal even when thread shows full outbound cadence."""
         from workflows.detect_responses import _detect_cadence_drift
         threads = [{
+            "participantProfileUrl": "https://linkedin.com/in/cadence-test",
             "participantFullName": "Patricia Ejemplo",
             "totalMessageCount": "3",
             "isLastMessageFromMe": "true",
@@ -563,6 +568,7 @@ class TestCadenceDriftDetector:
                 "stage": PipelineStage.NOT_INTERESTED.value,
                 "dm_step": 0,
                 "company_name": "Novo Nordisk",
+                "linkedin_url": "https://linkedin.com/in/cadence-test",
                 "record_id": "r3",
             }],
         }
@@ -582,6 +588,7 @@ class TestCadenceDriftDetector:
         that set and this row would infer an active stage and get un-parked.)"""
         from workflows.detect_responses import _detect_cadence_drift
         threads = [{
+            "participantProfileUrl": "https://linkedin.com/in/cadence-test",
             "participantFullName": "Daniel Mayorga",
             "totalMessageCount": "3",
             "isLastMessageFromMe": "true",
@@ -591,6 +598,7 @@ class TestCadenceDriftDetector:
                 "stage": PipelineStage.UNREACHABLE.value,
                 "dm_step": 0,
                 "company_name": "Nissan",
+                "linkedin_url": "https://linkedin.com/in/cadence-test",
                 "record_id": "r-unreach",
             }],
         }
@@ -606,6 +614,7 @@ class TestCadenceDriftDetector:
         """Accepted prospect with dm_step=0 but thread shows 2 outbound from us → drift up."""
         from workflows.detect_responses import _detect_cadence_drift
         threads = [{
+            "participantProfileUrl": "https://linkedin.com/in/cadence-test",
             "participantFullName": "Rafael Ejemplo",
             "totalMessageCount": "2",
             "isLastMessageFromMe": "true",
@@ -615,6 +624,7 @@ class TestCadenceDriftDetector:
                 "stage": PipelineStage.ACCEPTED.value,
                 "dm_step": 0,
                 "company_name": "FarmaSur",
+                "linkedin_url": "https://linkedin.com/in/cadence-test",
                 "record_id": "r4",
             }],
         }
@@ -627,6 +637,7 @@ class TestCadenceDriftDetector:
         """DM1 Sent in Attio but no outbound messages exist → drift down."""
         from workflows.detect_responses import _detect_cadence_drift
         threads = [{
+            "participantProfileUrl": "https://linkedin.com/in/cadence-test",
             "participantFullName": "Phantom Send",
             "totalMessageCount": "0",
             "isLastMessageFromMe": "false",
@@ -636,6 +647,7 @@ class TestCadenceDriftDetector:
                 "stage": PipelineStage.DM1_SENT.value,
                 "dm_step": 1,
                 "company_name": "PhantomCo",
+                "linkedin_url": "https://linkedin.com/in/cadence-test",
                 "record_id": "r5",
             }],
         }
@@ -647,6 +659,7 @@ class TestCadenceDriftDetector:
         """Inbox thread for a non-pipeline contact → no false positive."""
         from workflows.detect_responses import _detect_cadence_drift
         threads = [{
+            "participantProfileUrl": "https://linkedin.com/in/cadence-test",
             "participantFullName": "Random Person",
             "totalMessageCount": "5",
             "isLastMessageFromMe": "true",
@@ -659,6 +672,7 @@ class TestCadenceDriftDetector:
         repair can write to Attio without re-deriving them."""
         from workflows.detect_responses import _detect_cadence_drift
         threads = [{
+            "participantProfileUrl": "https://linkedin.com/in/cadence-test",
             "participantFullName": "Arianne Sales",
             "totalMessageCount": "5",
             "isLastMessageFromMe": "true",
@@ -668,6 +682,7 @@ class TestCadenceDriftDetector:
                 "stage": PipelineStage.DM1_SENT.value,
                 "dm_step": 1,
                 "company_name": "Stellantis",
+                "linkedin_url": "https://linkedin.com/in/cadence-test",
                 "record_id": "r-arianne",
                 "entry_id": "e-arianne",
             }],
@@ -696,7 +711,8 @@ class TestCadenceAutoRepair:
             "thread_last_from_me": True,
             "inferred_stage": PipelineStage.DM3_SENT.value,
             "inferred_dm_step": 3,
-            "record_id": "r-arianne",
+            "linkedin_url": "https://linkedin.com/in/cadence-test",
+                "record_id": "r-arianne",
             "entry_id": "e-arianne",
         }
         base.update(overrides)
@@ -883,7 +899,7 @@ class TestAutoRepairIntegration:
         # moves to RESPONDED. Drift detector would also see this as drift
         # (inferred_stage=DM3_SENT) but should defer to classifier.
         pb.download_result_csv.return_value = _make_sn_csv({
-            "participantProfileUrl": "https://linkedin.com/sales/people/ACw1",
+            "participantProfileUrl": "https://linkedin.com/in/test",
             "participantFullName": "Manual Reply Case",
             "isLastMessageFromMe": "true",
             "lastMessageBody": "Hola, gracias por escribir.",
@@ -892,7 +908,7 @@ class TestAutoRepairIntegration:
         })
         mock_cache = MagicMock()
         mock_cache.get.side_effect = (
-            lambda rid: ("Manual Reply Case", "Co", "url", "", "Title")
+            lambda rid: ("Manual Reply Case", "Co", "https://linkedin.com/in/test", "", "Title")
             if rid == "r1" else ("", "", "", "", "")
         )
         # parse_entry pass-through: test fixture entries are already in
@@ -989,7 +1005,7 @@ class TestManualTouchDetection:
 
     def _row(self, *, body=None, from_me="true", name=None, count="5", row_date=None) -> dict:
         return {
-            "participantProfileUrl": "https://linkedin.com/sales/people/ACw123",
+            "participantProfileUrl": "https://linkedin.com/in/vanessa",
             "participantFullName": self.NAME if name is None else name,
             "isLastMessageFromMe": from_me,
             "lastMessageBody": self.BODY if body is None else body,
@@ -1001,6 +1017,7 @@ class TestManualTouchDetection:
                record_id="r-resp", last_contact="2026-04-01", merged_into=None) -> dict:
         e = _make_entry(entry_id, record_id, stage, dm_step=3)
         e["prospect_name"] = self.NAME
+        e["linkedin_url"] = "https://linkedin.com/in/vanessa"
         e["company_name"] = "Acme"
         e["last_contact_date"] = last_contact
         e["merged_into"] = merged_into
@@ -1200,12 +1217,12 @@ class TestManualTouchDetection:
             self._entry(entry_id="e-a", record_id="r-a"),
             self._entry(entry_id="e-b", record_id="r-b"),
         ]
-        counts, attio, _ = self._run(tmp_path, rows=[self._row()], entries=two_people)
-        assert counts["manual_touch_ambiguous_name"] == 1
+        counts, attio, _ = self._run(tmp_path, rows=[{**self._row(), "participantProfileUrl": ""}], entries=two_people)
+        assert counts["identity_holds"] == 1
         assert counts["manual_touches_detected"] == 0
         attio.update_list_entry.assert_not_called()
         attio.create_note.assert_not_called()
-        assert "different people" in capsys.readouterr().err
+        assert "identity hold" in capsys.readouterr().err
 
     def test_same_person_two_entries_both_recorded(self, tmp_path):
         """Two list entries for ONE record (same record_id) is not ambiguous."""
@@ -1309,7 +1326,7 @@ class TestManualTouchDetection:
         csv_content = _make_sn_csv(
             self._row(),
             {
-                "participantProfileUrl": "https://linkedin.com/sales/people/ACw9",
+                "participantProfileUrl": "https://linkedin.com/in/carlos",
                 "participantFullName": "Carlos Lopez",
                 "isLastMessageFromMe": "true",
                 "lastMessageBody": "our dm1",
@@ -1319,8 +1336,8 @@ class TestManualTouchDetection:
         )
         pb.download_result_csv.return_value = csv_content
         name_map = {
-            "r-dm": ("Carlos Lopez", "Beta", "https://li.com/in/carlos", "", ""),
-            "r-resp": (self.NAME, "Acme", "https://li.com/in/vanessa", "", ""),
+            "r-dm": ("Carlos Lopez", "Beta", "https://linkedin.com/in/carlos", "", ""),
+            "r-resp": (self.NAME, "Acme", "https://linkedin.com/in/vanessa", "", ""),
         }
         with patch("workflows.detect_responses.AttioClient.parse_entry", side_effect=lambda e: e), \
              patch("workflows.detect_responses._pb_session_args", return_value={}), \
@@ -1482,12 +1499,12 @@ class TestManualTouchBallTracking:
         state = {**self._ours_state(), "e-other": {**self._ours_state()["e-resp"]}}
         counts, _, state_path = self._run(
             tmp_path,
-            rows=[self._row(from_me="false", body="ok")],
+            rows=[{**self._row(from_me="false", body="ok"), "participantProfileUrl": ""}],
             entries=[self._entry(), self._entry(entry_id="e-other", record_id="r-other")],
             state=state,
         )
         assert counts["manual_touch_prospect_replied"] == 0
-        assert counts["manual_touch_ambiguous_name"] == 1
+        assert counts["identity_holds"] == 1
         saved = self._state(state_path)
         assert saved["e-resp"]["ball"] == "ours" and saved["e-other"]["ball"] == "ours"
 

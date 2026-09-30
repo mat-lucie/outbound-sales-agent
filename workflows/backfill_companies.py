@@ -303,7 +303,7 @@ def repair_bad_companies(
 
     Returns the backfill_import summary dict.
     """
-    from clients.google_sheets import profiles_per_launch, write_prospects_to_sheet
+    from clients.google_sheets import write_prospects_to_sheet
     from workflows.daily_check_helpers import (
         _fresh_csv_name,
         build_sales_nav_launch_args,
@@ -357,7 +357,9 @@ def repair_bad_companies(
     sheet_rows = [{"profileUrl": row["linkedin_url"]} for row in rows]
     # columns must match the row keys — the default ["linkedInUrl", "message"]
     # shape would write an empty sheet and the scraper would no-op silently.
-    sheet_url = write_prospects_to_sheet(sheet_rows, columns=["profileUrl"])
+    sheet_url = write_prospects_to_sheet(
+        sheet_rows, columns=["profileUrl"], include_header=False
+    )
     click.echo(f"  Wrote {len(sheet_rows)} URLs to Google Sheet")
 
     # Saved-args + identities-inject contract lives in the shared helper
@@ -376,7 +378,7 @@ def repair_bad_companies(
             pb,
             sales_nav_profile_scraper_id,
             spreadsheet_url=sheet_url,
-            launch_count=profiles_per_launch(len(sheet_rows)),
+            launch_count=len(sheet_rows),
         ),
         # Fresh result-file name per launch: PB keys the phantom's
         # processed-inputs dedup DB on the file name, and a repair re-scrape

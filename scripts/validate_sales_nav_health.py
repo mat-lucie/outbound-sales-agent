@@ -55,7 +55,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv  # noqa: E402
 
-from clients.pb_envelope import PBRunFailed, PBRunTimeout  # noqa: E402
+from clients.pb_envelope import AUTH_FAILURE_MARKERS, PBRunFailed, PBRunTimeout  # noqa: E402
 from clients.phantombuster import PhantomBusterClient  # noqa: E402
 
 CheckStatus = Literal["ok", "warn", "fail", "skipped"]
@@ -219,11 +219,25 @@ def check_regular_cookie_health() -> CheckResult:
                 "— rotate PB_LI_SESSION_COOKIE",
             )
     log = (last_output.get("output", "") or "").lower()
-    if "401" in log or ("session cookie" in log and "expired" in log):
+    # T1.1: check canonical AUTH_FAILURE_MARKERS from pb_envelope in addition
+    # to the legacy "401" / "session cookie ... expired" pair. This closes
+    # the 2026-06-05 false-positive where "no valid credentials" / "network-
+    # cookie-invalid" log text went undetected and green-lit a dead cookie.
+    auth_failed = "401" in log or any(marker in log for marker in AUTH_FAILURE_MARKERS)
+    if auth_failed:
         return CheckResult(
             "regular_cookie_health",
             "fail",
-            "PB log indicates LinkedIn auth failure (401 / session expired)",
+            "PB log indicates LinkedIn auth failure (401 / auth marker hit) "
+            "— rotate PB_LI_SESSION_COOKIE",
+        )
+    # T1.1 addendum: a non-zero/failed last-run status is itself a signal.
+    if last_output.get("status") == "error":
+        return CheckResult(
+            "regular_cookie_health",
+            "fail",
+            "PB container status=error — regular cookie likely invalidated "
+            "or phantom mis-configured",
         )
     return CheckResult(
         "regular_cookie_health",

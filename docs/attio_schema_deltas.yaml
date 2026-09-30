@@ -544,8 +544,8 @@ attributes:
     options: null
     pr_id: PR-43
     status: shipped
-    write_owner_module: workflows.weekly_prospect._build_prospect_entry_attrs
-    note: "Computed from prospect_committed_at + quarantine business days."
+    write_owner_module: [workflows.weekly_prospect._build_prospect_entry_attrs, workflows.daily_check.run_connection_requests]
+    note: "Prospect quarantine and prelaunch invitation holds for unconfirmed outcomes."
 
   # ---------- LinkedIn Outreach: recheck-cache architecture (F-PR-8, §3.5) ----------
   - object: linkedin_outreach

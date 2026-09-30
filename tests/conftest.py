@@ -189,6 +189,7 @@ def _isolate_degree_check_backend_env(monkeypatch):
     for var in (
         "PB_SALES_NAV_PROFILE_SCRAPER_ID",
         "PB_LI_SALES_NAV_SESSION_COOKIE",
+        "OUTBOUND_INBOX_IDENTITY_MAP",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -375,6 +376,7 @@ def _isolate_email_sent_ledger(monkeypatch, tmp_path):
     """
     from workflows import email_compliance
 
+    monkeypatch.setattr(email_compliance, "LEDGER_DIR", tmp_path)
     monkeypatch.setattr(
         email_compliance, "LEDGER_FILE", tmp_path / "email_sent.json"
     )
@@ -484,3 +486,10 @@ def no_retry_sleep(monkeypatch):
     import clients.attio as attio_mod
 
     monkeypatch.setattr(attio_mod.time, "sleep", lambda _s: None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_acceptance_checkpoint(monkeypatch, tmp_path):
+    """Daily tests must never consume or overwrite the operator checkpoint."""
+    from workflows import phase_checkpoint
+    monkeypatch.setattr(phase_checkpoint, "CHECKPOINT_PATH", tmp_path / "acceptance.json")

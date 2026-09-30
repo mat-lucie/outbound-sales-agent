@@ -64,6 +64,7 @@ def _make_sn_csv(**fields) -> str:
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=fieldnames)
     writer.writeheader()
+    fields.setdefault("participantProfileUrl", "https://linkedin.com/in/p")
     writer.writerow({k: fields.get(k, "") for k in fieldnames})
     return buf.getvalue()
 
@@ -93,7 +94,7 @@ def _run_detect(
         patch("workflows.detect_responses.RecordCache") as MockCache,
     ):
         mock_cache_instance = MagicMock()
-        mock_cache_instance.get.return_value = (prospect_name, company, "https://li.com/in/p", "", "")
+        mock_cache_instance.get.return_value = (prospect_name, company, "https://linkedin.com/in/p", "", "")
         MockCache.return_value = mock_cache_instance
         return detect_responses(attio, pb, inbox_scraper_id="scraper-x")
 
@@ -588,7 +589,7 @@ class TestAttioFailureHandling:
         writer = csv.DictWriter(buf, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerow({
-            "participantProfileUrl": "https://li.com/in/orphan-1",
+            "participantProfileUrl": "https://linkedin.com/in/orphan-1",
             "participantFullName": "Orphan One",
             "isLastMessageFromMe": "false",
             "lastMessageBody": "Interesado, agendemos",
@@ -596,7 +597,7 @@ class TestAttioFailureHandling:
             "totalMessageCount": "2",
         })
         writer.writerow({
-            "participantProfileUrl": "https://li.com/in/orphan-2",
+            "participantProfileUrl": "https://linkedin.com/in/orphan-2",
             "participantFullName": "Orphan Two",
             "isLastMessageFromMe": "false",
             "lastMessageBody": "Tambien interesado, agendemos",
@@ -608,8 +609,8 @@ class TestAttioFailureHandling:
         # Per-record cache.get → distinct prospect names so name-based
         # matching maps each CSV row to a unique entry.
         cache_lookup = {
-            "r-esc-1": ("Orphan One", "Acme", "https://li.com/in/orphan-1", "", ""),
-            "r-esc-2": ("Orphan Two", "Beta", "https://li.com/in/orphan-2", "", ""),
+            "r-esc-1": ("Orphan One", "Acme", "https://linkedin.com/in/orphan-1", "", ""),
+            "r-esc-2": ("Orphan Two", "Beta", "https://linkedin.com/in/orphan-2", "", ""),
         }
 
         # Patch escalate to ITSELF raise. The FIX-C wrap in

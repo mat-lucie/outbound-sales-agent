@@ -424,7 +424,10 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
     ("linkedin_outreach", "prospect_committed_at"):
         "workflows.weekly_prospect._build_prospect_entry_attrs",
     ("linkedin_outreach", "invite_eligible_after"):
-        "workflows.weekly_prospect._build_prospect_entry_attrs",
+        [
+            "workflows.weekly_prospect._build_prospect_entry_attrs",
+            "workflows.daily_check.run_connection_requests",
+        ],
 
     # ---- LinkedIn Outreach: provenance pointers (F-PR-3.7) ----
     ("linkedin_outreach", "last_classified_by"):

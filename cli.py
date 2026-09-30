@@ -3,8 +3,7 @@
 import contextlib
 import os
 import sys
-from datetime import date
-from typing import Any
+from datetime import UTC, date, datetime
 
 import click
 import httpx
@@ -21,6 +20,8 @@ from clients.pb_config import load_pb_config  # noqa: E402 — after sys.path/do
 # Module-level so the send-dms reattach is monkeypatchable as
 # ``cli.attach_daily_run`` in tests (the name the gate guards resolve through).
 from workflows.daily_run import attach_daily_run  # noqa: E402 — after sys.path/dotenv setup
+
+EXIT_TEMPLATE_REFUSE = 78  # EX_CONFIG: deterministic copy defect needs an operator fix.
 
 
 @contextlib.contextmanager
@@ -198,16 +199,36 @@ def cli():
     pass
 
 
+def _raise_failed_dm_batches(result: dict) -> None:
+    """Make approved delivery failures non-successful without retrying sends."""
+    failures = result.get("failed_batches") or []
+    if not failures:
+        return
+    sent = sum(int(result.get(step, 0) or 0) for step in ("dm1", "dm2", "dm3"))
+    status = "PARTIAL FAILURE" if sent else "FAILED"
+    details = "; ".join(
+        f"{batch['step']} container={batch['container_id']} "
+        f"requested={batch['requested']} confirmed={batch['confirmed_sent']}"
+        for batch in failures
+    )
+    raise click.ClickException(
+        f"DM delivery {status}: {len(failures)} failed approved DM batch(es) "
+        f"({details}). Earlier confirmed sends remain counted. "
+        "Review pb_silent_no_op evidence before any retry."
+    )
+
+
 @cli.command()
-@click.option("--dry-run", is_flag=True, help="Preview actions without executing")
+@click.option("--dry-run", is_flag=True, help="Read-only pipeline inventory; no scrapes or writes; live readiness unchecked")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts (for cron)")
-@click.option("--batch-size", default=lambda: load_outreach_config().invite_batch_size, help="Max connection requests per run (default: config/outreach.yaml → caps.invite_batch_size; capped by caps.invites_per_day)")
+@click.option("--batch-size", type=click.IntRange(min=1), default=lambda: load_outreach_config().invite_batch_size, help="Max connection requests per run (default: config/outreach.yaml → caps.invite_batch_size; capped by caps.invites_per_day)")
 @click.option("--network-booster-id", default=lambda: load_pb_config().network_booster_id or None, help="PhantomBuster Network Booster agent ID (default: config/phantombuster.yaml → PB_NETWORK_BOOSTER_ID)")
 @click.option("--message-sender-id", default=lambda: load_pb_config().message_sender_id or None, help="PhantomBuster Message Sender agent ID (default: config/phantombuster.yaml → PB_MESSAGE_SENDER_ID)")
 @click.option("--profile-scraper-id", default=lambda: load_pb_config().profile_scraper_id or None, help="PhantomBuster Profile Scraper agent ID, legacy backend — documented-dead: the agent was deleted from the PB workspace; only useful with a re-deployed phantom (default: config/phantombuster.yaml → PB_PROFILE_SCRAPER_ID)")
 @click.option("--sales-nav-profile-scraper-id", default=lambda: load_pb_config().sales_nav_profile_scraper_id or None, help="PhantomBuster Sales Navigator Profile Scraper agent ID, sales_nav backend (the default) (default: config/phantombuster.yaml → PB_SALES_NAV_PROFILE_SCRAPER_ID)")
 @click.option("--inbox-scraper-id", default=lambda: load_pb_config().inbox_scraper_id or None, help="PhantomBuster Inbox Scraper agent ID (default: config/phantombuster.yaml → PB_INBOX_SCRAPER_ID)")
 @click.option("--skip-dms", is_flag=True, help="Skip Part B DM sequencing (connections only)")
+@click.option("--preview-dms-after-invites", is_flag=True, help="Rehearse DMs with the shared record cache after live invites; requires --skip-dms")
 @click.option("--skip-followups", is_flag=True, help="Skip Phase C (warm follow-up radar). Phase C is read-only detection; it never sends. Fails-closed-clean when the radar schema is absent, so a schemaless install runs it as a no-op regardless.")
 @click.option("--force-weekend", is_flag=True, help="Override the Mon-Fri-only outreach rule")
 @click.option(
@@ -226,17 +247,26 @@ def cli():
          "stamped send_channel=botdog are held out of PB sends either way "
          "until they are re-stamped send_channel=pb.",
 )
-def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profile_scraper_id, sales_nav_profile_scraper_id, inbox_scraper_id, skip_dms, skip_followups, force_weekend, allow_stale, botdog_send_enabled):
+def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profile_scraper_id, sales_nav_profile_scraper_id, inbox_scraper_id, skip_dms, preview_dms_after_invites, skip_followups, force_weekend, allow_stale, botdog_send_enabled):
     """Daily check: send connections, queue DMs, detect responses."""
+    if preview_dms_after_invites and (not skip_dms or dry_run):
+        raise click.UsageError("--preview-dms-after-invites requires --skip-dms in a live daily run")
+    if dry_run:
+        from workflows.daily_preview import preview_daily
+        preview_daily(skip_dms=skip_dms, force_weekend=force_weekend)
+        return
     from clients.gmail import GmailClient, GmailCredentialsMissing
     from clients.phantombuster import PhantomBusterClient
     from models.business_calendar import is_send_day, operator_today
     from models.run_mode import RunMode
     from workflows.audit import AuditLogger
     from workflows.daily_check import (
+        BlankMessageError,
+        UnresolvedPlaceholderError,
         compute_dm1_sent_cohort_by_date,
         compute_due_dm_counts,
         detect_accepted_connections,
+        drain_connection_invites,
         run_connection_requests,
         run_dm_sequencing,
         run_end_summary,
@@ -249,14 +279,16 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
         open_daily_run,
     )
     from workflows.detect_email_responses import detect_email_responses
-    from workflows.detect_responses import NoCSVHalt, detect_responses
+    from workflows.detect_responses import IdentityResolutionHalt, NoCSVHalt, detect_responses
     from workflows.escalation import escalate
     from workflows.metrics import (
         DailyRunMetrics,
         phase_timer,
         record_phase_or_skip,
     )
+    from workflows.phase_checkpoint import AcceptanceCheckpoint
     from workflows.record_cache import RecordCache, preload_pipeline_persons
+    from workflows.run_evidence import record_run
     from workflows.run_lock import (
         EXIT_TEMPFAIL,
         RunLockHeld,
@@ -305,7 +337,10 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
     try:
         with acquire_run_lock(lock_name, run_id=run_id), \
                 AuditLogger(workflow="daily_check", dry_run=dry_run) as audit_logger, \
+                record_run(audit_logger, code_provenance), \
                 _crm_provider() as crm, PhantomBusterClient() as pb:
+            if not dry_run:
+                pb.reconcile_workspace()
             # PR-17 B-SD-001: open the daily_run row before any send-path
             # work. F-PR-8's ``(run_date, machine_id)`` uniqueness raises
             # ConcurrentRunInAttio on collision — surface as typed
@@ -324,8 +359,14 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                 else open_daily_run(crm, run_id=run_id, run_date=today)
             )
 
+            phase0_backend = load_pb_config().degree_check_backend_raw.strip()
+            phase0_required_id = sales_nav_profile_scraper_id if phase0_backend == "sales_nav" else profile_scraper_id
             try:
-                with daily_run_cm as daily_run:
+                with daily_run_cm as daily_run, AcceptanceCheckpoint(
+                    operator_id="single", day=today, provenance=code_provenance,
+                    backend=phase0_backend,
+                    scraper_id=phase0_required_id,
+                ) as acceptance_checkpoint:
                     # Bulk-preload person records once so all four phases share a warm cache.
                     # Skips ~593 redundant get_person calls per run vs. the per-phase cache pattern.
                     list_id = os.environ.get("ATTIO_LIST_ID", "")
@@ -492,15 +533,12 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                         click.echo("Skipping (dry run)\n")
                         metrics.pb_launches_skipped_dry_run += 1
                     elif phase0_required_id:
-                        metrics.pb_launches_attempted += 1
-                        # detect_accepted_connections is daily-only but deeply
-                        # Attio-coupled (_get_all_entries_parsed + cache reads
-                        # priming attio._person_to_company + _attio_advance);
-                        # keep it on the raw client via the escape hatch.
-                        accept_result = detect_accepted_connections(
+                        if acceptance_checkpoint.resume_result is None:
+                            metrics.pb_launches_attempted += 1
+                        accept_result = acceptance_checkpoint.run(lambda: detect_accepted_connections(
                             _attio_inner_client(crm), pb, profile_scraper_id, cache=cache,
                             sales_nav_profile_scraper_id=sales_nav_profile_scraper_id,
-                        )
+                        ))
                         _phase0_deferred = accept_result.get("deferred", 0)
                         _phase0_deferred_note = (
                             f" ({_phase0_deferred} stale profile(s) beyond the "
@@ -515,6 +553,9 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                     else:
                         click.echo(f"Skipping (no {phase0_missing_env} set for backend={phase0_backend})\n")
 
+                    # An identity hold blocks every DM, including rehearsal,
+                    # while independent invitation checks may still proceed.
+                    reply_identity_hold: IdentityResolutionHalt | None = None
                     # Phase 0.5: Detect message responses.
                     click.echo("--- Phase 0.5: Detect Message Responses ---")
                     if mode.is_dry_run():
@@ -538,6 +579,15 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                                     cache=cache, resend=resend_client,
                                     daily_run=daily_run if isinstance(daily_run, DailyRun) else None,
                                 )
+                            except IdentityResolutionHalt as exc:
+                                reply_identity_hold = exc
+                                resp_result = {"detected": 0}
+                                click.echo(
+                                    f"  ⚠ Reply identity check held: {exc}. "
+                                    "Continuing invitation checks; all DMs remain held.",
+                                    err=True,
+                                )
+                                metrics.warn("reply_identity_hold: DMs held; invites continue")
                             except NoCSVHalt as exc:
                                 # PR-19 B-SD-005: typed halt with exit
                                 # code 2 (operator-visible non-success;
@@ -644,7 +694,7 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                                 )
                         except Exception as exc:  # noqa: BLE001 — see comment above
                             click.echo(
-                                f"  ⚠ Botdog event ingestion SKIPPED "
+                                f"  ⚠ Phase 0.7 (Botdog event ingestion) FAILED "
                                 f"[{type(exc).__name__}: {exc}] — "
                                 f"event-confirmed advances for "
                                 f"botdog-stamped rows are delayed to the "
@@ -838,50 +888,135 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                             # rc=2 (WARN) prints the warning and continues —
                             # caller still gets to approve the batch interactively.
 
-                    # Part A: Connection requests + re-checks.
+                    # Part A: Connection requests.
                     click.echo("--- Part A: Connection Requests ---")
+                    # Pre-send template-guard halt (UnresolvedPlaceholderError /
+                    # BlankMessageError from run_connection_requests /
+                    # run_dm_sequencing): remember the halt, keep emitting the
+                    # run summary + rollup + Phase C for the parts that DID
+                    # run, then re-raise at the end of the run body so the
+                    # daily_run row closes as failed and the matching handler
+                    # below applies the curated ⚠ REFUSE exit.
+                    conn_result: dict
+                    dm_result: dict
+                    guard_halt: Exception | None = None
                     if network_booster_id:
-                        # run_connection_requests is daily-only but Attio-quirk
-                        # coupled (throttle reads attio.get_company raw dict +
-                        # attio._person_to_company, _pre_invite_degree_check,
-                        # _get_all_entries_parsed); escape hatch at the boundary.
-                        conn_result = run_connection_requests(
-                            _attio_inner_client(crm), pb, network_booster_id,
-                            batch_size=batch_size, dry_run=dry_run, auto_confirm=yes, cache=cache,
-                            profile_scraper_id=profile_scraper_id,
-                            sales_nav_profile_scraper_id=sales_nav_profile_scraper_id,
-                            audit_logger=audit_logger,
-                            today=today,
-                            # _DryRunDailyRun structurally satisfies DailyRun
-                            # here the same way it does for run_dm_sequencing.
-                            daily_run=daily_run,  # type: ignore[arg-type]
-                        )
+
+                        try:
+                            def _run_one_invite_container(
+                                remaining_target: int,
+                                remaining_us: int | None,
+                                attempted_entry_ids: set[str],
+                                attempted_company_ids: set[str],
+                                attempted_urls: set[str],
+                            ) -> dict:
+                                return run_connection_requests(
+                                    _attio_inner_client(crm), pb, network_booster_id,
+                                    batch_size=remaining_target, dry_run=dry_run,
+                                    auto_confirm=yes, cache=cache,
+                                    profile_scraper_id=profile_scraper_id,
+                                    sales_nav_profile_scraper_id=sales_nav_profile_scraper_id,
+                                    audit_logger=audit_logger, today=today,
+                                    daily_run=daily_run,
+                                    exclude_entry_ids=attempted_entry_ids,
+                                    exclude_company_ids=attempted_company_ids,
+                                    exclude_linkedin_urls=attempted_urls,
+                                )
+
+                            conn_result = drain_connection_invites(
+                                _run_one_invite_container,
+                                batch_size=batch_size,
+                                daily_run=daily_run,  # type: ignore[arg-type]
+                                dry_run=dry_run,
+                            )
+                        except (BlankMessageError, UnresolvedPlaceholderError) as exc:
+                            # Guard fires BEFORE any invite ships — nothing
+                            # went out for Part A. (The invite path today
+                            # raises only UnresolvedPlaceholderError — it has
+                            # no blank-copy guard; BlankMessageError is caught
+                            # for parity with Part B so adding that guard
+                            # later needs no CLI change.)
+                            guard_halt = exc
+                            conn_result = dict(getattr(exc, "partial_results", None) or {"sent": 0})
+                            conn_result["reason"] = "template_guard_halt"
+                            click.echo(f"  ⚠ REFUSE: {exc}", err=True)
+                            metrics.warn(
+                                f"template_guard_halt part=A "
+                                f"{type(exc).__name__}"
+                            )
+
                     else:
                         click.echo("Skipping connections (no PB_NETWORK_BOOSTER_ID set)")
                         conn_result = {"sent": 0, "reason": "no_agent_id"}
 
                     # Part B: DM sequencing (Mon-Fri only)
                     click.echo("\n--- Part B: DM Sequencing ---")
-                    if not dms_allowed:
+                    if reply_identity_hold is not None:
+                        click.echo("Skipping DMs and rehearsal (reply identity check held).")
+                        dm_result = {"dm1": 0, "dm2": 0, "dm3": 0, "reason": "reply_identity_hold"}
+                    elif guard_halt is not None:
+                        # A systemic template break halted Part A — don't
+                        # keep sending on the other lane of the same
+                        # content pipeline.
+                        click.echo(
+                            "Skipping DMs (Part A halted on a pre-send "
+                            "template guard — fix the template, then re-run)."
+                        )
+                        dm_result = {"dm1": 0, "dm2": 0, "dm3": 0, "reason": "template_guard_halt"}
+                    elif not dms_allowed:
                         click.echo(f"Weekend ({today}) — skipping DM sends. Use --force-weekend to override.")
-                        dm_result: dict[str, Any] = {"dm1": 0, "dm2": 0, "dm3": 0, "reason": "weekend"}
+                        dm_result = {"dm1": 0, "dm2": 0, "dm3": 0, "reason": "weekend"}
                     elif skip_dms:
                         click.echo("Skipping DMs (--skip-dms)")
                         dm_result = {"dm1": 0, "dm2": 0, "dm3": 0, "reason": "skip_dms"}
+                        if preview_dms_after_invites and message_sender_id:
+                            click.echo("DM rehearsal using this run's record cache (no DM sends):")
+                            run_dm_sequencing(
+                                _attio_inner_client(crm), pb, message_sender_id,
+                                dry_run=True, auto_confirm=False, cache=cache,
+                                audit_logger=audit_logger,
+                                daily_run=daily_run, metrics=metrics,
+                                preview_no_writes=True,
+                            )
+                        elif preview_dms_after_invites:
+                            click.echo("DM rehearsal unavailable (no PB_MESSAGE_SENDER_ID set)")
                     elif message_sender_id:
                         # _DryRunDailyRun structurally satisfies DailyRun
                         # for run_dm_sequencing's needs but isn't a
                         # subclass — accept the type mismatch.
-                        # run_dm_sequencing shares run_connection_requests'
-                        # Attio-quirk coupling (throttle, is_person_company_corrupted,
-                        # _get_all_entries_parsed); escape hatch at the boundary.
-                        dm_result = run_dm_sequencing(
-                            _attio_inner_client(crm), pb, message_sender_id,
-                            dry_run=dry_run, auto_confirm=yes, cache=cache,
-                            audit_logger=audit_logger,
-                            daily_run=daily_run,  # type: ignore[arg-type]
-                            metrics=metrics,
-                        )
+
+                        try:
+                            dm_result = run_dm_sequencing(
+                                _attio_inner_client(crm), pb, message_sender_id,
+                                dry_run=dry_run, auto_confirm=yes, cache=cache,
+                                audit_logger=audit_logger,
+                                daily_run=daily_run,
+                                metrics=metrics,
+                                # Same freeze-and-drain flag as Part A: the
+                                # DM channel split honors it, so a stamped
+                                # row never sends while the flag is off.
+                            )
+                        except (BlankMessageError, UnresolvedPlaceholderError) as exc:
+                            # Guard fires BEFORE the halted step's preview /
+                            # lease / transport (nothing sent for it), but
+                            # Part A invites are already out and EARLIER DM
+                            # steps may have shipped (the guard runs per
+                            # step). run_dm_sequencing attaches its realized
+                            # counts to the exception so the rollup below
+                            # reports what actually went out — never a
+                            # fabricated zero.
+                            guard_halt = exc
+                            _partial = getattr(exc, "partial_results", None)
+                            dm_result = {
+                                **(_partial or {"dm1": 0, "dm2": 0, "dm3": 0}),
+                                "reason": "template_guard_halt",
+                            }
+                            click.echo(f"  ⚠ REFUSE: {exc}", err=True)
+                            metrics.warn(
+                                f"template_guard_halt part=B "
+                                f"{type(exc).__name__}"
+                            )
+
                     else:
                         click.echo("Skipping DMs (no PB_MESSAGE_SENDER_ID set)")
                         dm_result = {"dm1": 0, "dm2": 0, "dm3": 0, "reason": "no_agent_id"}
@@ -891,47 +1026,67 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                     # dry-run because daily_run is a ``_DryRunDailyRun``
                     # stub with no real Attio record_id.
                     if not mode.is_dry_run() and isinstance(daily_run, DailyRun):
-                        due_counts = compute_due_dm_counts(
-                            crm, cache=cache, today=today
-                        )
-                        run_summary = run_end_summary(
-                            crm, daily_run,
-                            prospect_pool_size=due_counts["prospect_pool_size"],
-                            due_dm1_count=due_counts["due_dm1_count"],
-                            due_dm2_count=due_counts["due_dm2_count"],
-                            due_dm3_count=due_counts["due_dm3_count"],
-                            today=today,
-                        )
-                        click.echo(
-                            f"\n  Run-end summary: pool={run_summary['prospect_pool_size']}, "
-                            f"due_dm1={run_summary['due_dm1_count']}, "
-                            f"due_dm2={run_summary['due_dm2_count']}, "
-                            f"due_dm3={run_summary['due_dm3_count']}, "
-                            f"degree_unknown={run_summary['degree_unknown_count']}, "
-                            f"signal={run_summary['starvation_signal']}."
-                        )
-                        # Read-only cohort visibility: how many rows landed in
-                        # DM1_SENT per send-date over the last business week, so
-                        # a genuine daily cohort is legible against same-day
-                        # re-prospected duplicates inflating the stage total.
-                        dm1_cohort = compute_dm1_sent_cohort_by_date(
-                            _attio_inner_client(crm), today=today
-                        )
-                        if dm1_cohort:
-                            breakdown = ", ".join(
-                                f"{day}={count}" for day, count in dm1_cohort
+                        try:
+                            due_counts = compute_due_dm_counts(
+                                crm, cache=cache, today=today
+                            )
+                            run_summary = run_end_summary(
+                                crm, daily_run,
+                                prospect_pool_size=due_counts["prospect_pool_size"],
+                                due_dm1_count=due_counts["due_dm1_count"],
+                                due_dm2_count=due_counts["due_dm2_count"],
+                                due_dm3_count=due_counts["due_dm3_count"],
+                                today=today,
                             )
                             click.echo(
-                                f"  DM1 Sent cohort by send-date (last 5 business "
-                                f"days): {breakdown}."
+                                f"\n  Run-end summary: pool={run_summary['prospect_pool_size']}, "
+                                f"due_dm1={run_summary['due_dm1_count']}, "
+                                f"due_dm2={run_summary['due_dm2_count']}, "
+                                f"due_dm3={run_summary['due_dm3_count']}, "
+                                f"degree_unknown={run_summary['degree_unknown_count']}, "
+                                f"signal={run_summary['starvation_signal']}."
                             )
-                        else:
+                            # Read-only cohort visibility: how many rows landed in
+                            # DM1_SENT per send-date over the last business week, so
+                            # a genuine daily cohort is legible against same-day
+                            # re-prospected duplicates inflating the stage total.
+                            dm1_cohort = compute_dm1_sent_cohort_by_date(
+                                _attio_inner_client(crm), today=today
+                            )
+                            if dm1_cohort:
+                                breakdown = ", ".join(
+                                    f"{day}={count}" for day, count in dm1_cohort
+                                )
+                                click.echo(
+                                    f"  DM1 Sent cohort by send-date (last 5 business "
+                                    f"days): {breakdown}."
+                                )
+                            else:
+                                click.echo(
+                                    "  DM1 Sent cohort by send-date (last 5 business "
+                                    "days): none."
+                                )
+                        except Exception as _sum_exc:  # noqa: BLE001 — guard-halt shield, see below
+                            # On a template or identity halt this is best-effort:
+                            # letting a transient Attio failure here propagate
+                            # would DISCARD guard_halt — the run would exit with
+                            # a raw traceback blaming the blip instead of the
+                            # broken template. Without a halt, the pre-existing
+                            # contract holds: summary failures propagate.
+                            if guard_halt is None and reply_identity_hold is None:
+                                raise
                             click.echo(
-                                "  DM1 Sent cohort by send-date (last 5 business "
-                                "days): none."
+                                f"  ⚠ Run-end summary failed after a send "
+                                f"hold ({type(_sum_exc).__name__}: "
+                                f"{_sum_exc}) — continuing to the curated "
+                                f"refusal.",
+                                err=True,
                             )
 
-                    click.echo("\n=== Daily Check Complete ===")
+                    click.echo(
+                        "\n=== Daily Check FAILED ===" if guard_halt is not None or reply_identity_hold is not None or dm_result.get("failed_batches")
+                        else "\n=== Daily Check Complete ==="
+                    )
                     click.echo(f"Connections sent: {conn_result.get('sent', 0)}")
                     total_dms = dm_result.get("dm1", 0) + dm_result.get("dm2", 0) + dm_result.get("dm3", 0)
                     click.echo(f"DMs sent: {total_dms}")
@@ -985,6 +1140,14 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                         try:
                             from workflows.followup_radar import run_followup_radar
                             fu = run_followup_radar(crm, today=today)
+                            from workflows.gmail_inventory import save_inventory
+                            radar_path = audit_logger.path.with_suffix(".radar.json")
+                            save_inventory(radar_path, {
+                                "schema_version": 1, "run_id": run_id,
+                                "code": code_provenance, "as_of": datetime.now(UTC).isoformat(),
+                                "radar": fu,
+                            })
+                            click.echo(f"Radar evidence: {radar_path}")
                             click.echo(fu["digest"])
                             click.echo(
                                 f"  ({fu['surfaced']} surfaced"
@@ -1001,6 +1164,23 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                                 f"{traceback.format_exc()}",
                                 err=True,
                             )
+
+
+                    # A pre-send template guard halted Part A or Part B: the
+                    # summary/rollup/Phase C above already covered the parts
+                    # that ran. Re-raise the ORIGINAL exception (not a
+                    # SystemExit) so the daily_run row closes as "failed" —
+                    # same terminal status as before the guards got curated
+                    # handling — before the matching handler below converts
+                    # it into the ⚠ REFUSE + EX_TEMPFAIL exit.
+                    if guard_halt is not None:
+                        raise guard_halt
+
+                    if reply_identity_hold is not None:
+                        raise reply_identity_hold
+
+                    _raise_failed_dm_batches(dm_result)
+
             except MalformedDailyRunRow as exc:
                 # The pre-open same-day scan (multi-row incident guard)
                 # fails closed on a prior row with a corrupt counter.
@@ -1050,6 +1230,20 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                     err=True,
                 )
                 raise SystemExit(EXIT_TEMPFAIL) from exc
+            except (BlankMessageError, UnresolvedPlaceholderError) as exc:
+                # Pre-send template guard (re-raised above after the partial
+                # summary/rollup). A broken template is operator-fixable —
+                # curated refusal instead of a raw traceback. The full guard
+                # message repeats here on purpose: the tail of stderr is what
+                # a truncated launchd log or a skimming operator actually reads.
+                # This is deterministic, so a retry could send another Part A
+                # invite batch before reaching the same broken DM template.
+                click.echo(
+                    f"  ⚠ REFUSE: {exc} Fix the template, then re-run. "
+                    f"Exiting EX_CONFIG ({EXIT_TEMPLATE_REFUSE}).",
+                    err=True,
+                )
+                raise SystemExit(EXIT_TEMPLATE_REFUSE) from exc
     except RunLockHeld as exc:
         log_lock_refused(lock_name, exc)
         raise SystemExit(EXIT_TEMPFAIL) from exc
@@ -1087,7 +1281,11 @@ def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, forc
     from models.business_calendar import is_send_day, operator_today
     from models.run_mode import RunMode
     from workflows.audit import AuditLogger
-    from workflows.daily_check import run_dm_sequencing
+    from workflows.daily_check import (
+        BlankMessageError,
+        UnresolvedPlaceholderError,
+        run_dm_sequencing,
+    )
     from workflows.daily_run import (
         MalformedDailyRunRow,
         NoDailyRunRow,
@@ -1137,6 +1335,8 @@ def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, forc
         with acquire_run_lock(lock_name, run_id=run_id), \
                 AuditLogger(workflow="send_dms", dry_run=dry_run) as audit_logger, \
                 _crm_provider() as crm, PhantomBusterClient() as pb:
+            if not dry_run:
+                pb.reconcile_workspace()
             # Schema-drift pre-flight (wet path only) — parity with daily.
             if not mode.is_dry_run():
                 click.echo("--- Pre-flight: Attio schema-drift check ---")
@@ -1259,7 +1459,7 @@ def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, forc
                         return
 
                     click.echo("\n--- Part B: DM Sequencing ---")
-                    run_dm_sequencing(
+                    dm_result = run_dm_sequencing(
                         _attio_inner_client(crm), pb, message_sender_id,
                         dry_run=dry_run, auto_confirm=yes, cache=cache,
                         audit_logger=audit_logger,
@@ -1267,7 +1467,13 @@ def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, forc
                         exclude_ids=set(exclude_ids),
                         metrics=metrics,
                     )
+                    total_dms = sum(
+                        int(dm_result.get(step, 0) or 0)
+                        for step in ("dm1", "dm2", "dm3")
+                    )
+                    click.echo(f"\nDMs sent: {total_dms}")
                     click.echo(f"\nCode: {format_provenance(code_provenance)}")
+                    _raise_failed_dm_batches(dm_result)
             except NoDailyRunRow as exc:
                 click.echo(f"  ⚠ {exc} Exiting EX_TEMPFAIL.", err=True)
                 raise SystemExit(EXIT_TEMPFAIL) from exc
@@ -1285,6 +1491,22 @@ def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, forc
                     err=True,
                 )
                 raise SystemExit(EXIT_TEMPFAIL) from exc
+            except (BlankMessageError, UnresolvedPlaceholderError) as exc:
+                # Pre-send template guard from run_dm_sequencing: nothing was
+                # previewed or sent for the HALTED step (earlier steps in the
+                # same call may have shipped — their advances are already in
+                # Attio). A broken template is operator-fixable — curated
+                # refusal instead of a raw traceback. This deterministic
+                # content defect requires an operator fix, not an auto retry.
+                metrics.warn(
+                    f"template_guard_halt {type(exc).__name__}"
+                )
+                click.echo(
+                    f"  ⚠ REFUSE: {exc} Fix the template, then re-run. "
+                    f"Exiting EX_CONFIG ({EXIT_TEMPLATE_REFUSE}).",
+                    err=True,
+                )
+                raise SystemExit(EXIT_TEMPLATE_REFUSE) from exc
     except RunLockHeld as exc:
         log_lock_refused(lock_name, exc)
         raise SystemExit(EXIT_TEMPFAIL) from exc
@@ -1339,6 +1561,8 @@ def weekly(dry_run, batch_size, search_export_id, yes, allow_stale):
     try:
         with acquire_run_lock(lock_name, run_id=run_id), \
                 _crm_provider() as crm, PhantomBusterClient() as pb:
+            if not dry_run:
+                pb.reconcile_workspace()
             run_weekly_prospecting(
                 crm, pb, search_export_id,
                 batch_size=batch_size, dry_run=dry_run,
@@ -1480,6 +1704,8 @@ def pain_signal(
     try:
         with acquire_run_lock(lock_name, run_id=run_id), \
                 _crm_provider() as crm, PhantomBusterClient() as pb:
+            if not dry_run:
+                pb.reconcile_workspace()
             run_pain_signal_discovery(
                 crm, pb, posts_worker_id, commenters_worker_id,
                 likers_worker_id, sales_nav_profile_scraper_id,
@@ -1612,10 +1838,12 @@ def canary():
             # safety-critical line: a non-dict return must fall to None and
             # fail closed, never raise past the contract.
             note_id = note.get("id", {}).get("note_id") if isinstance(note, dict) else None
-        except Exception as exc:  # noqa: BLE001 — any failure here means write scope is not live
+        except Exception as exc:  # noqa: BLE001 — fail closed with a compatible halt token
+            from workflows.canary_diagnostics import canary_failure_detail
             click.echo(
                 f"mcp_scope_insufficient: write leg failed on canary record "
-                f"{record_id} — {type(exc).__name__}: {exc}",
+                f"{record_id} — {canary_failure_detail(exc)} "
+                f"({type(exc).__name__}: {exc})",
                 err=True,
             )
             raise SystemExit(1) from exc
@@ -1632,10 +1860,12 @@ def canary():
         try:
             deleted = attio.delete_note(note_id)
         except Exception as exc:  # noqa: BLE001 — delete scope is not live
+            from workflows.canary_diagnostics import canary_failure_detail
             click.echo(
                 f"mcp_scope_insufficient: delete leg failed — note {note_id} on "
-                f"canary record {record_id} was created but NOT deleted "
-                f"({type(exc).__name__}: {exc}). Orphan note left behind; "
+                f"canary record {record_id} was created; deletion could not be confirmed "
+                f"({type(exc).__name__}: {exc}). {canary_failure_detail(exc)} "
+                f"Possible orphan note; verify whether it remains, then "
                 f"delete it manually (DELETE /v2/notes/{note_id}).",
                 err=True,
             )
@@ -1901,14 +2131,25 @@ def email_association_cmd(dry_run, yes, force_weekend):
     """Send one-shot association outreach emails (e.g., AFAMO partnership ask). Idempotent."""
     from clients.resend_client import ResendClient
     from workflows.association_outreach import run_association_outreach
+    from workflows.audit import AuditLogger
+    from workflows.run_lock import EXIT_TEMPFAIL, RunLockHeld, acquire_run_lock, log_lock_refused
 
     click.echo("=== Outbound Agent -- Association Outreach ===\n")
 
     resend = None if dry_run else ResendClient()
+    lock_name = "sales-email-daily"
+    run_id = f"{lock_name}-{date.today().isoformat()}-{os.getpid()}"
     try:
-        run_association_outreach(
-            resend, dry_run=dry_run, auto_confirm=yes, force_weekend=force_weekend
-        )
+        with acquire_run_lock(lock_name, run_id=run_id), \
+                AuditLogger(workflow="association_outreach", dry_run=dry_run) as audit_logger, \
+                _attio_client() as attio:
+            run_association_outreach(
+                resend, dry_run=dry_run, auto_confirm=yes, force_weekend=force_weekend,
+                attio=attio, audit_logger=audit_logger,
+            )
+    except RunLockHeld as exc:
+        log_lock_refused(lock_name, exc)
+        raise SystemExit(EXIT_TEMPFAIL) from exc
     finally:
         if resend:
             resend.close()
@@ -2968,8 +3209,9 @@ def health_check_cmd() -> None:
         from clients.phantombuster import PhantomBusterClient
 
         with PhantomBusterClient() as _pb:
-            pass  # construction alone verifies env + connection setup
+            _pb.list_agents()
         click.echo("PhantomBuster: OK")
+        click.echo("Session-cookie liveness requires a separate scraper health check.")
     except Exception as exc:
         failures.append(f"PhantomBuster: FAIL ({type(exc).__name__}: {exc})")
 
@@ -3269,10 +3511,18 @@ def followup_mute_batch_cmd(object_, id_file):
 @cli.command("followup-callback")
 @click.option("--object", "object_", type=click.Choice(_FOLLOWUP_OBJECTS), required=True)
 @click.option("--id", "target_id", required=True)
-@click.option("--date", "cb_date", required=True, help="YYYY-MM-DD — reconnect date; radar hard-surfaces it then.")
-def followup_callback_cmd(object_, target_id, cb_date):
-    """Set a deferral tickler ('contáctame en agosto') — suppress until the date,
-    then hard-surface as Owed."""
+@click.option("--date", "cb_date", default=None, help="YYYY-MM-DD — reconnect date; radar hard-surfaces it then.")
+@click.option("--clear", is_flag=True, help="Null the callback instead — the tickler fired and you acted on it (run BEFORE followup-await --since; callback + waiting never coexist).")
+def followup_callback_cmd(object_, target_id, cb_date, clear):
+    """Set (or with --clear, null) a deferral tickler ('contáctame en agosto')
+    — suppress until the date, then hard-surface as Owed. Clear it once the
+    callback has been discharged, so the account can enter the WAITING cycle."""
+    if clear == bool(cb_date):
+        click.echo("ERROR: pass exactly one of --date or --clear", err=True)
+        raise SystemExit(1)
+    if clear:
+        _followup_state_call("clear_callback", object_, target_id)
+        return
     cb = date.fromisoformat(cb_date)
     _reject_absurd_followup_date(cb, "callback --date")
     _followup_state_call("set_callback", object_, target_id, callback=cb)

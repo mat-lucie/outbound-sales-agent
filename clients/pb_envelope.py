@@ -40,9 +40,10 @@ import csv
 import hashlib
 import io
 import json
+import re
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 from clients.attio import linkedin_identity_map, resolve_identity_match
 
@@ -111,6 +112,7 @@ class SendOutcome:
     next_day_drift_key: str
     sent_urls: frozenset[str] = field(default_factory=frozenset)
     skipped_urls: frozenset[str] = field(default_factory=frozenset)
+    already_pending_urls: frozenset[str] = field(default_factory=frozenset)
     # True when the send phantom reported its input as already-processed
     # (Auto Connect dedup: "We already processed every profile from this
     # spreadsheet"). This is the EXPLICIT already-invited signal — distinct
@@ -119,6 +121,8 @@ class SendOutcome:
     already_processed: bool = False
 
     def __post_init__(self) -> None:
+        if not self.already_pending_urls <= self.sent_urls:
+            raise ValueError("SendOutcome pending URLs must be confirmed URLs")
         if self.sent_count != len(self.sent_urls):
             raise ValueError(
                 f"SendOutcome invariant: sent_count={self.sent_count} "
@@ -427,19 +431,20 @@ def should_advance_batch(launch: PBLaunch, outcome: SendOutcome) -> bool:
 
 
 # Markers that mean the LinkedIn session itself failed — invites did NOT go out.
-# These (and ONLY these) must block the invite optimistic-advance below. The
+# These identify failed LinkedIn authentication. The
 # benign "please check on LinkedIn that you can manually invite profiles"
 # warning is NOT here: operator-confirmed, the invites still send through it.
-_AUTH_FAILURE_MARKERS = (
+AUTH_FAILURE_MARKERS = (
     "no valid credentials",
     "network-cookie-invalid",
     "can't connect to linkedin with this session cookie",
     "session cookie not valid",
     "session expired",
 )
+_AUTH_FAILURE_MARKERS = AUTH_FAILURE_MARKERS
 
 # LinkedIn throughput/restriction signals — invites are silently DROPPED (not
-# sent) when these fire, so they must ALSO block the optimistic advance.
+# sent) when these fire, so they must remain visible in diagnostics.
 # Unlike auth failures these are RECURRING for an active outreach account
 # (the weekly invite cap is hit routinely). Advancing on a cap would falsely
 # mark un-sent prospects CONNECTION_SENT and Phase 0 would wait forever for an
@@ -502,7 +507,7 @@ INVITE_OPTIMISTIC_ADVANCE = "invite_optimistic_advance"
 
 
 def invite_launch_advanceable(completion: PBCompletion) -> bool:
-    """True only if a clean Network Booster launch may optimistically advance.
+    """Report whether the log contains an auth or account-limit warning.
 
     Blocks on BOTH auth failure (dead cookie → nothing sent) AND any LinkedIn
     cap/restriction signal (weekly invite limit, pending ceiling, account
@@ -511,55 +516,104 @@ def invite_launch_advanceable(completion: PBCompletion) -> bool:
     and Phase 0 would wait forever for an acceptance that cannot come.
     """
     log = (completion.log_output or "").lower()
-    return not any(
-        marker in log
-        for marker in (*_AUTH_FAILURE_MARKERS, *_CAP_RESTRICTION_MARKERS)
-    )
+    if any(marker in log for marker in _AUTH_FAILURE_MARKERS):
+        return False
+    return not any(marker in log for marker in _CAP_RESTRICTION_MARKERS)
 
 
 def compute_invite_outcome(
     outcome: SendOutcome,
     completion: PBCompletion,
     requested_urls: set[str],
+    *,
+    launch_batch_size: int | None = None,
 ) -> SendOutcome:
-    """Invite-path override of the (unreliable) parsed Network Booster outcome.
+    """Advance only invites confirmed by this container's per-person log.
 
-    Authoritative advance: on a clean launch (authenticated, no cap/restriction)
-    with at least one requested invite, mark ALL requested URLs as sent so the
-    standard per-row advance path runs (with correct experiment-cohort
-    stamping), stamping `drift_skipped_reason=INVITE_OPTIMISTIC_ADVANCE` so the
-    advance is auditable. Otherwise return the parsed outcome unchanged:
-      - `already_processed` → the existing Pattern-A branch handles it.
-      - auth failure / cap / restriction → stays Skipped → gate fails →
-        pb_silent_no_op (invites re-queue; never a false CONNECTION_SENT).
-      - no requested invites (recheck-only batch) → nothing to advance.
-
-    Advancing every requested row on a clean launch is deliberate: withholding
-    rows that the phantom physically invited but omitted from its per-launch log
-    (log-format drift OR its own already-processed dedup) left them at PROSPECT
-    and re-fed them forever — the daily re-selection leak, with pending invites
-    piling up on LinkedIn. The explicit per-launch profile-count argument removed
-    the silent truncation that once motivated a `requested ∩ processed` gate, so
-    a row absent from the parsed list is now a benign artifact, not an
-    un-attempted row. The HARD blocks remain in `invite_launch_advanceable`
-    (auth failure / cap / restriction → invites did NOT go out → no advance),
-    and the pre-invite degree check reconciles the rare ghost via
-    `hasPendingInvitation`.
-
-    DM batches must NOT use this — they have a reliable `status` column and go
-    through `parse_send_outcome` + `should_advance_batch` directly.
+    Network Booster's cumulative CSV lacks a reliable per-run status column.
+    A clean container or a pre-visit URL list is not delivery evidence. The
+    exact "Invitation sent to" or "already sent, still pending" line is.
+    Batch-level already-processed means only that the phantom saw the input
+    before, not that it invited every person, so it cannot advance anyone.
     """
-    if outcome.already_processed:
-        return outcome
-    if not requested_urls:
-        return outcome
-    if not invite_launch_advanceable(completion):
-        return outcome
+    # A cap/auth error can occur *after* earlier people were invited. Exact
+    # success lines remain evidence for those people; the rest stay held.
+    newly_sent, already_pending = parse_invite_confirmed_urls(
+        completion.log_output, requested_urls
+    )
+    confirmed = newly_sent | already_pending
     return replace(
         outcome,
-        csv_status="Message sent",
-        sent_urls=frozenset(requested_urls),
+        csv_status="Message sent" if confirmed else "Skipped",
+        sent_urls=confirmed,
+        already_pending_urls=already_pending,
         skipped_urls=frozenset(),
-        sent_count=len(requested_urls),
-        drift_skipped_reason=INVITE_OPTIMISTIC_ADVANCE,
+        sent_count=len(confirmed),
+        already_processed=False,
+        drift_skipped_reason=(
+            None if len(confirmed) == len(requested_urls)
+            else f"invite_log_confirmed_{len(confirmed)}_of_{len(requested_urls)}"
+        ),
     )
+
+
+def parse_invite_confirmed_urls(
+    log_output: str | None, requested_urls: set[str]
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Match explicit per-person send or pending lines to requested URLs.
+
+    A clean container and its pre-visit URL list cannot prove delivery.
+    Unknown log formats fail closed so they cannot advance a CRM stage.
+    """
+    requested_by_slug: dict[str, set[str]] = {}
+    requested_by_hex_suffix: dict[str, set[str]] = {}
+    requested_by_id = linkedin_identity_map(requested_urls)
+    for url in requested_urls:
+        parsed = urlsplit(url)
+        parts = parsed.path.strip("/").split("/")
+        if parsed.hostname not in {"linkedin.com", "www.linkedin.com"}:
+            continue
+        if len(parts) != 2 or parts[0] != "in" or not parts[1]:
+            continue
+        slug = unquote(parts[1]).casefold()
+        requested_by_slug.setdefault(slug, set()).add(url)
+        hex_suffix = re.search(r"-([0-9a-f]{8})$", slug)
+        if hex_suffix:
+            requested_by_hex_suffix.setdefault(hex_suffix.group(1), set()).add(url)
+
+    newly_sent: set[str] = set()
+    already_pending: set[str] = set()
+    for line in (log_output or "").splitlines():
+        sent = re.search(r"Invitation sent to ([^\s]+)", line, re.I)
+        destination = newly_sent if sent else already_pending
+        if sent:
+            slug = unquote(sent.group(1).rstrip(".,")).casefold()
+        else:
+            pending = re.search(
+                r"Invitation for (https?://[^\s]+) already sent, still pending",
+                line, re.I,
+            )
+            if not pending:
+                continue
+            slug = unquote(urlsplit(pending.group(1)).path.rstrip("/").split("/")[-1]).casefold()
+        matches = requested_by_slug.get(slug, set())
+        if len(matches) == 1:
+            destination.update(matches)
+        elif not matches:
+            alias = resolve_identity_match(
+                f"https://linkedin.com/in/{slug}", requested_urls, requested_by_id
+            )
+            if alias:
+                destination.add(alias)
+            else:
+                hex_suffix = re.search(r"-([0-9a-f]{8})$", slug)
+                if hex_suffix:
+                    suffix_matches = requested_by_hex_suffix.get(hex_suffix.group(1), set())
+                    if len(suffix_matches) == 1:
+                        destination.update(suffix_matches)
+    already_pending -= newly_sent
+    return frozenset(newly_sent), frozenset(already_pending)
+
+
+
+NETWORK_BOOSTER_BUILTIN_PER_LAUNCH_CAP = 10

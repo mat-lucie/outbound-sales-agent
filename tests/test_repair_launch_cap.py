@@ -14,7 +14,6 @@ from __future__ import annotations
 import csv
 from unittest.mock import MagicMock, patch
 
-from clients.google_sheets import profiles_per_launch
 from workflows.backfill_companies import (
     REPAIR_MAX_PROFILES_PER_LAUNCH,
     repair_bad_companies,
@@ -84,7 +83,8 @@ def _run_repair(tmp_path, monkeypatch, n_rows: int, pb: MagicMock | None = None)
     pb = pb or _mock_pb()
     sheet_calls: list[list[dict]] = []
 
-    def _capture_sheet(rows, columns=None):
+    def _capture_sheet(rows, columns=None, include_header=True):
+        assert include_header is False
         sheet_calls.append(rows)
         return "https://s"
 
@@ -113,7 +113,7 @@ def test_oversized_backlog_is_capped_and_tail_deferred(tmp_path, monkeypatch):
     # cap + header must stay under the phantom's schema max or PB rejects the
     # whole launch.
     launch_args = pb.launch_agent.call_args.args[1]
-    assert launch_args["numberOfProfilesPerLaunch"] == profiles_per_launch(
+    assert launch_args["numberOfProfilesPerLaunch"] == (
         REPAIR_MAX_PROFILES_PER_LAUNCH
     )
 
@@ -129,7 +129,7 @@ def test_within_cap_batch_passes_through_unchanged(tmp_path, monkeypatch):
     summary, pb, sheet_calls, _ = _run_repair(tmp_path, monkeypatch, 5)
 
     launch_args = pb.launch_agent.call_args.args[1]
-    assert launch_args["numberOfProfilesPerLaunch"] == profiles_per_launch(5)
+    assert launch_args["numberOfProfilesPerLaunch"] == (5)
     assert len(sheet_calls[0]) == 5
     assert summary["deferred"] == 0
 
@@ -138,7 +138,7 @@ def test_batch_exactly_at_cap_is_not_deferred(tmp_path, monkeypatch):
     summary, pb, _, _ = _run_repair(tmp_path, monkeypatch, REPAIR_MAX_PROFILES_PER_LAUNCH)
 
     launch_args = pb.launch_agent.call_args.args[1]
-    assert launch_args["numberOfProfilesPerLaunch"] == profiles_per_launch(
+    assert launch_args["numberOfProfilesPerLaunch"] == (
         REPAIR_MAX_PROFILES_PER_LAUNCH
     )
     assert summary["deferred"] == 0
@@ -195,7 +195,7 @@ def test_repair_launch_carries_sn_full_argument_contract(tmp_path, monkeypatch):
     args = pb.launch_agent.call_args.args
     assert args[0] == "sn-scraper-id"
     launch_args = args[1]
-    assert launch_args["numberOfProfilesPerLaunch"] == profiles_per_launch(4)
+    assert launch_args["numberOfProfilesPerLaunch"] == (4)
     # SN full-argument contract.
     assert launch_args["savedField"] == "keep-me"
     assert launch_args["identities"][0]["sessionCookie"] == "fake-sn-li-at"

@@ -236,7 +236,17 @@ def _load_ledger() -> dict[str, str]:
             f"everyone in the crash window. Inspect the file, fix or delete it, "
             f"then re-run. (--dry-run does not touch the ledger and is exempt.)"
         ) from exc
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        # Valid JSON but not an object (null / [] / "…"): NOT a usable send
+        # history. Treating it as empty would re-email every contact in the
+        # crash window — the exact outcome the fail-loud contract forbids.
+        raise LedgerCorruptError(
+            f"Email sent-ledger at {LEDGER_FILE} parsed as "
+            f"{type(data).__name__}, not an object. Live email sends are "
+            f"BLOCKED until it is repaired: repair it to a JSON object "
+            f"({{}} for a genuine reset — not [] or null) and re-run."
+        )
+    return data
 
 
 def already_sent(record_id: str, step: str) -> bool:

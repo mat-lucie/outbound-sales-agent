@@ -37,14 +37,14 @@ writing one.
 
 ## Hard safety rails
 
-1. **Dry-run first, always.** `sales weekly --dry-run` and `sales daily
-   --dry-run` print what would happen without sending. Never drop `--dry-run`
+1. **Dry-run first, always.** `sales weekly --dry-run` previews work; `sales daily
+   --dry-run` reads pipeline inventory with live send readiness unchecked. Never drop `--dry-run`
    unless the user explicitly tells you to send for real — sending DMs/invites/
    emails is an outward-facing, irreversible action with legal exposure
    (LinkedIn ToS, CAN-SPAM/GDPR — see [COMPLIANCE.md](COMPLIANCE.md)).
 2. **The shipped content is an example program, not yours to send.** Repo-root
    `content/*.json`, `sales-program.md`, and `config/icp.example.yaml` are the
-   original operator's worked example. They must be replaced with the user's
+   neutral defaults. They must be replaced with the user's
    own ICP and copy before any wet run (`examples/acme/` is a synthetic worked
    example; gaps are listed in [docs/LIMITATIONS.md](docs/LIMITATIONS.md)).
 3. **Secrets live only in `.env`.** The YAML configs reference env-var *names*,
@@ -53,7 +53,8 @@ writing one.
 4. **LLM steps route through you.** The engine never holds an Anthropic API
    key. With `OUTBOUND_USE_LLM_DISPATCH=1`, LLM work (qualifier tiebreaks,
    reply classification) is surfaced as JSON handoff files under
-   `~/.outbound-agent/llm_dispatch/inbox/`; the operational skills
+   `~/.outbound-agent/llm_dispatch/inbox/` for Claude, or the private per-run
+   `OUTBOUND_LLM_DISPATCH_SESSION` for Codex; the operational skills
    (`skills/sales-daily/`, `skills/sales-weekly/`) tell you how to poll the
    inbox, answer each request, and write the response to `outbox/`.
 

@@ -8,11 +8,13 @@ sibling file, and the engine's script picks the response up and continues.
 
 # Handoff mechanism (per F-PR-9 brainstorm)
 
-File-based inbox/outbox under ``~/.outbound-agent/llm_dispatch/``:
+Codex uses a private per-run ``OUTBOUND_LLM_DISPATCH_SESSION`` directory.
+See ``docs/llm_dispatch_skill_handoff.md`` for the supervised lifecycle.
+Legacy callers retain inbox/outbox under ``~/.outbound-agent/llm_dispatch/``:
 
   - The engine script writes ``inbox/{step}-{dispatch_id}.json`` with the
     request payload and blocks on ``outbox/{step}-{dispatch_id}.json``.
-  - Parent skill (``~/.claude/skills/sales-daily/SKILL.md``) polls the
+  - Parent skill (``~/.agents/skills/sales-daily/SKILL.md``) polls the
     inbox directory, dispatches an Agent subagent for each new file,
     and writes the response to the outbox.
   - The engine script polls every ``poll_interval_s`` (default 0.5s) up to
@@ -47,6 +49,8 @@ import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
+
+from workflows.run_evidence import observed
 
 DEFAULT_DISPATCH_DIR = Path.home() / ".outbound-agent" / "llm_dispatch"
 DISPATCH_ENABLED_ENV = "OUTBOUND_USE_LLM_DISPATCH"
@@ -245,6 +249,12 @@ class LLMDispatchResult:
     error: str | None = None
 
     def __post_init__(self) -> None:
+        if type(self.success) is not bool or not isinstance(self.raw_text, str):
+            raise ValueError("Dispatch success must be boolean and raw_text must be text")
+        if not isinstance(self.dispatch_id, str) or not self.dispatch_id:
+            raise ValueError("Dispatch ID must be non-empty text")
+        if self.error is not None and not isinstance(self.error, str):
+            raise ValueError("Dispatch error must be text or null")
         if self.success and self.error is not None:
             raise ValueError(
                 f"LLMDispatchResult dispatch_id={self.dispatch_id!r}: "
@@ -301,6 +311,13 @@ def request_llm_dispatch(
     if poll_interval_s is None:
         poll_interval_s = DEFAULT_POLL_INTERVAL_S
 
+    session_root = os.environ.get("OUTBOUND_LLM_DISPATCH_SESSION")
+    if session_root:
+        from workflows.codex_dispatch import validate_session
+        root = validate_session(Path(session_root))
+        if inbox_dir is not None or outbox_dir is not None:
+            raise ValueError("Session dispatch cannot override inbox/outbox paths")
+        inbox_dir, outbox_dir = root / "inbox", root / "outbox"
     estimated = estimate_cost_usd(step, model_class)
     # `try_reserve` raises `CostCeilingExhausted` itself (with the real
     # cap + consumed numbers when PR-35's ledger is wired). Stub raises
@@ -333,7 +350,14 @@ def request_llm_dispatch(
     )
     # Atomic write via tempfile + rename so a polling reader never
     # observes a torn JSON.
-    _atomic_write_json(inbox_file, asdict(request))
+    if session_root:
+        from workflows.codex_dispatch import session_lock
+        # Closing and publishing must share one lock. The earlier validation
+        # can become stale while the budget reservation is in flight.
+        with session_lock(root):
+            _atomic_write_json(inbox_file, asdict(request))
+    else:
+        _atomic_write_json(inbox_file, asdict(request))
     log_dispatch(step, dispatch_id, f"inbox written; blocking on outbox (timeout={timeout_s}s)")
 
     try:
@@ -343,12 +367,16 @@ def request_llm_dispatch(
             timeout_s=timeout_s,
             step=step,
             dispatch_id=dispatch_id,
+            atomic_published=bool(session_root),
         )
     except LLMDispatchTimeout:
-        # Leave the inbox file in place so the parent skill can
-        # re-pick it up on the next invocation. Re-raise so the
-        # caller knows the dispatch didn't complete.
-        log_dispatch(step, dispatch_id, f"timeout after {timeout_s}s — inbox preserved for retry")
+        # Session requests are no longer actionable after requester timeout.
+        # Preserve legacy non-session forensics behavior for existing callers.
+        if session_root:
+            from workflows.codex_dispatch import expire_request
+            expire_request(root, inbox_file)
+        state = "expired" if session_root else "preserved for diagnosis"
+        log_dispatch(step, dispatch_id, f"timeout after {timeout_s}s — request {state}")
         raise
 
     # Clean up BOTH files. The `__post_init__` validator on
@@ -369,15 +397,22 @@ def request_llm_dispatch(
     return result
 
 
-def _atomic_write_json(path: Path, payload: dict) -> None:
+def _atomic_write_json(path: Path, payload: dict, *, exclusive: bool = False) -> None:
     """Write JSON via tempfile + os.replace so concurrent readers never
     see a torn write. Mirrors the F-PR-8 daily_run.pid pattern."""
     import contextlib
 
-    tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp_path = path.with_name(f"{path.name}.tmp.{uuid.uuid4().hex}")
     try:
-        tmp_path.write_text(json.dumps(payload, indent=2))
-        os.replace(str(tmp_path), str(path))
+        with tmp_path.open("x", encoding="utf-8") as handle:
+            os.chmod(tmp_path, 0o600)
+            json.dump(payload, handle, indent=2)
+        if exclusive:
+            # Hard-link publication is atomic and fails if a winner exists.
+            os.link(tmp_path, path)
+            tmp_path.unlink()
+        else:
+            os.replace(str(tmp_path), str(path))
     except OSError:
         # Best-effort tempfile cleanup; we re-raise the original OSError
         # so the caller sees the real failure, not the cleanup error.
@@ -386,16 +421,18 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
         raise
 
 
+@observed("llm.dispatch_wait", "agent_wait")
 def _poll_for_outbox(
     outbox_file: Path,
     poll_interval_s: float,
     timeout_s: float,
     step: str,
     dispatch_id: str,
+    atomic_published: bool = False,
 ) -> LLMDispatchResult:
     """Block until ``outbox_file`` is readable JSON or ``timeout_s``
-    elapses. ``JSONDecodeError`` during the polling window IS a mid-
-    write race and is skipped — the next iteration retries.
+    elapses. Legacy writers may expose a partial JSON file, so retry those
+    parse errors. Session writers publish atomically; malformed JSON fails.
 
     Other errors propagate. Specifically, ``TypeError`` from
     ``LLMDispatchResult(**payload)`` indicates schema drift (extra or
@@ -408,14 +445,21 @@ def _poll_for_outbox(
         if outbox_file.exists():
             try:
                 payload = json.loads(outbox_file.read_text())
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                if atomic_published:
+                    raise LLMDispatchFailed(
+                        step, dispatch_id, f"Malformed response at {outbox_file}: {exc}"
+                    ) from exc
                 # Mid-write race — keep polling within the deadline.
                 time.sleep(poll_interval_s)
                 continue
             # JSON parsed cleanly — schema-drift errors (TypeError,
             # KeyError, ValueError from __post_init__) propagate so the
             # operator sees the real failure, not a generic timeout.
-            return LLMDispatchResult(**payload)
+            result = LLMDispatchResult(**payload)
+            if result.dispatch_id != dispatch_id:
+                raise LLMDispatchFailed(step, dispatch_id, "Response dispatch ID mismatch")
+            return result
         time.sleep(poll_interval_s)
     raise LLMDispatchTimeout(step, dispatch_id, timeout_s)
 
@@ -428,17 +472,21 @@ def write_dispatch_response(
     raw_text: str = "",
     success: bool = True,
     error: str | None = None,
+    exclusive: bool = False,
 ) -> None:
     """Helper for the parent skill (or tests) to write a response to the
     outbox. Production skill writes JSON directly; this helper exists
     so the round-trip shape is testable + the parent skill's SKILL.md
     can document the exact file format."""
+    import re
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", dispatch_id) or step not in TOKEN_ESTIMATES:
+        raise ValueError("Invalid dispatch ID or step")
     outbox_dir.mkdir(parents=True, exist_ok=True)
     outbox_file = outbox_dir / f"{step}-{dispatch_id}.json"
     result = LLMDispatchResult(
         dispatch_id=dispatch_id, success=success, raw_text=raw_text, error=error
     )
-    _atomic_write_json(outbox_file, asdict(result))
+    _atomic_write_json(outbox_file, asdict(result), exclusive=exclusive)
 
 
 def log_dispatch(step: str, dispatch_id: str, msg: str) -> None:

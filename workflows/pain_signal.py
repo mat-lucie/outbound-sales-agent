@@ -888,7 +888,6 @@ def _launch_enrichment_scrape(
     must never inherit (or poison) the degree-check phantom's state.
     """
     from clients.google_sheets import (
-        profiles_per_launch,
         write_prospects_to_sheet,
     )
     from workflows.daily_check_helpers import (
@@ -912,12 +911,14 @@ def _launch_enrichment_scrape(
             [{"profileUrl": u} for u in urls],
             columns=["profileUrl"],
             spreadsheet_id=dry_sheet_id,
+            include_header=False,
         )
         # +1 for the sheet header row PB counts as a processable line
         # (clients.google_sheets.profiles_per_launch — the header
         # otherwise eats one slot and the last profile of every batch
         # goes unscraped).
-        launch_count = profiles_per_launch(len(urls))
+        # The scraper sheet contains URLs only.
+        launch_count = len(urls)
 
     csv_name = _fresh_csv_name("ps-enr")
     launch_args = {

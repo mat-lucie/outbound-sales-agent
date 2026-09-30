@@ -2009,6 +2009,22 @@ def test_trim_reports_capped_waiting(identity_parsers):
     assert "displaced by the 2-slot draft cap" in summary["digest"]
 
 
+def test_limited_queue_keeps_partner_and_owed_ahead_of_urgent_linkedin(identity_parsers):
+    def candidate(name, lane, urgency, channel="email"):
+        return FollowupCandidate(
+            object="deals", record_id=name, reason=FollowupReason.RESPONDED_NO_NEXT_STEP,
+            lane=lane, last_touch=TODAY, silent_days=1, heat=1,
+            value_mult=1.0, urgency=urgency, channel_hint=channel,
+        )
+    candidates = [
+        candidate("linkedin", WarmLane.NUDGE, 100.0, "linkedin_only"),
+        candidate("owed", WarmLane.OWED, 2.0),
+        candidate("partner", WarmLane.PARTNER, 1.0),
+    ]
+    selected, _ = followup_radar._trim_with_lane_caps(candidates, 2)
+    assert {c.lane for c in selected} == {WarmLane.PARTNER, WarmLane.OWED}
+
+
 def test_degraded_empty_state_still_surfaces_waiting_counters(identity_parsers):
     # Review regression: a degraded run with zero candidates must not swallow
     # the exhausted/expired counts — they are operator work regardless.

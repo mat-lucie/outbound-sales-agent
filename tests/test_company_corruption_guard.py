@@ -157,6 +157,8 @@ class TestPhaseBSkipsCorruptedCompany:
         attio = _attio_with_full_schema()
         attio.query_list_entries.return_value = [entry]
         attio.is_person_company_corrupted.return_value = False
+        from tests.fakes import stub_guard_reread
+        stub_guard_reread(attio, [entry])
         # F-PR-5 typed PB mock: CSV with "Message sent" → gate passes.
         pb = _typed_pb_mock(
             csv_text=_make_sn_csv([{

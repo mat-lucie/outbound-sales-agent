@@ -66,8 +66,10 @@ What **you** must do:
   `List-Unsubscribe-Post` endpoint and the Resend bounce/complaint webhook
   require an internet-reachable service you stand up; they are not shipped. Until
   then, the mailto header + manual `email-unsubscribe` is the supported flow.
-- **`email-association` does not apply cross-channel suppression** (it takes no
-  CRM client). Curate that list manually. See [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
+- **Association outreach requires configured Attio authority through the CLI.**
+  It checks cross-channel suppression and shared sent state, and serializes
+  with the other email commands. Direct library callers that omit an Attio
+  client retain local-only behavior and must curate suppression manually.
 
 ## Data protection
 

@@ -15,7 +15,7 @@ Covers:
 from __future__ import annotations
 
 from datetime import date, timedelta
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -789,6 +789,7 @@ class TestHonestDmSendCounts:
         monkeypatch.setattr(daily_check, "_attio_advance_with_escalation", lambda **kw: True)
         # Prevent company-corruption guard from skipping all rows
         MagicMock_attio = MagicMock()
+        MagicMock_attio._person_to_company = {}
         MagicMock_attio.is_person_company_corrupted.return_value = False
         monkeypatch.setattr(daily_check, "_write_company_throttle_tally", MagicMock())
         monkeypatch.setattr(daily_check, "emit_pb_inmail_dead_end", MagicMock())
@@ -851,3 +852,10 @@ class TestNewEscalationTypeRegistration:
             f"Escalation type {slug!r} must have a TypedDict registered in "
             "ESCALATION_SCHEMAS so payload validation works at runtime."
         )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_stage_unit_boundary():
+    from workflows.email_send_guard import GuardResult
+    with patch("workflows.daily_check.verify_send_preconditions", return_value=GuardResult(True)), patch("workflows.dm_quality_gate.require_clear_dm_quality_queue"):
+        yield

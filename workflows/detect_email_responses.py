@@ -123,6 +123,21 @@ def _reconstruct_opener(language: str) -> str:
         template = get_email_template(EmailStep.EMAIL1, "en")
     subject = personalize_email(template.get("subject", ""), "there", "your company")
     body = _TAG_RE.sub(" ", personalize_email(template.get("body_html", ""), "there", "your company"))
+    if not subject.strip() or not body.strip():
+        # The lru_cache means this fires once per language per run, not
+        # per prospect. Loud but non-fatal: a blank opener degrades the
+        # classifier's context, it doesn't invalidate the reply itself.
+        blank = " + ".join(
+            name for name, value in (("subject", subject), ("body", body))
+            if not value.strip()
+        )
+        click.echo(
+            f"  ⚠ Reconstructed email-1 opener has blank {blank} for "
+            f"language '{language}' — check content/emails.json; the "
+            f"reply classifier is running without pitch context and "
+            f"classifications this run may be degraded.",
+            err=True,
+        )
     return f"Subject: {subject}\n\n{body}".strip()
 
 

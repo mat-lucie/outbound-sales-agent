@@ -25,6 +25,7 @@ import click
 from clients.crm.attio_provider import AttioProvider
 from clients.crm.base import CRMProvider
 from workflows.metrics import phase_timer, record_phase_or_skip
+from workflows.run_evidence import observed
 
 if TYPE_CHECKING:
     from clients.attio import AttioClient
@@ -94,6 +95,7 @@ class RecordCache:
         self._cache[record_id] = info
 
 
+@observed("crm_preload", "phase")
 def preload_pipeline_persons(
     attio: "CRMProvider | AttioClient",
     cache: RecordCache,

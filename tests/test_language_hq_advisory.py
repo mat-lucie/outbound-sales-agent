@@ -75,7 +75,7 @@ def _run_sequencing(
                   return_value="https://sheet.example/x"), \
             patch("workflows.daily_check._pb_session_args", return_value={}), \
             patch("workflows.daily_check._company_id_for_prospect",
-                  return_value=company_id), \
+                  side_effect=lambda _attio, rid: f"{company_id}-{rid}" if company_id else None), \
             patch("workflows.daily_check.company_throttle_permits",
                   return_value=True), \
             patch(

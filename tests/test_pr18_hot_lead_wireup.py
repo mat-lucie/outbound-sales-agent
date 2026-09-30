@@ -13,6 +13,8 @@ right code path. This file fills GAP-1 + GAP-3 + GAP-4:
 """
 from __future__ import annotations
 
+import csv
+import io
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -24,8 +26,12 @@ from workflows.hot_lead_alert import HotLeadEmitFailed, emit_hot_lead
 
 def _make_sn_csv(**row: str) -> str:
     """Build a single-row SN inbox scraper CSV."""
-    keys = list(row.keys())
-    return ",".join(keys) + "\n" + ",".join(row.values())
+    row.setdefault("participantProfileUrl", "https://linkedin.com/in/test-prospect")
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=list(row))
+    writer.writeheader()
+    writer.writerow(row)
+    return output.getvalue()
 
 
 def _attio_with_one_dm_prospect(
@@ -65,7 +71,7 @@ def _run_detect(attio, pb, *, csv: str, prospect_name: str, resend=None):
 
     with patch("workflows.detect_responses.RecordCache.get") as cache_get, \
          patch.dict("os.environ", {"ATTIO_LIST_ID": "list-1"}, clear=False):
-        cache_get.return_value = (prospect_name, "ACME", "https://x", "", "")
+        cache_get.return_value = (prospect_name, "ACME", "https://linkedin.com/in/test-prospect", "", "")
         return detect_responses(attio, pb, "agent-inbox", resend=resend)
 
 

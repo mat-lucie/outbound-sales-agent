@@ -11,21 +11,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.fakes import make_wave2_person as _make_attio_person
 from workflows.wave2_blast import WAVE2_STAGE, run_wave2_blast
-
-
-def _make_attio_person(record_id, first_name, last_name, email, stage, country="US"):
-    """Mock Attio person record for wave2 tests (mirrors prior wave2 fixture)."""
-    return {
-        "id": {"record_id": record_id},
-        "values": {
-            "name": [{"first_name": first_name, "last_name": last_name}],
-            "email_addresses": [{"email_address": email}],
-            "email_campaign_stage": [{"value": stage}],
-            "primary_location": [{"country_code": country}],
-            "company": [],
-        },
-    }
 
 
 @patch("workflows.wave2_blast.date")
@@ -45,7 +32,8 @@ def test_suppressed_record_is_skipped(mock_suppression, mock_collision, mock_dat
 
     result = run_wave2_blast(attio, resend, dry_run=False, auto_confirm=True)
 
-    assert result == {"sent": 0, "collisions": 0, "suppressed": 1}
+    assert result == {"sent": 0, "collisions": 0, "suppressed": 1, "send_guard_skipped": 0,
+        "already_sent_repaired": 0, "repair_failed": 0}
     resend.send_email.assert_not_called()
     attio.update_person.assert_not_called()
 
@@ -66,9 +54,15 @@ def test_non_suppressed_record_is_sent(mock_suppression, mock_collision, mock_da
     resend = MagicMock()
     resend.send_email.return_value = {"id": "msg-001"}
 
+    # Phase 3 guard: re-read must confirm stage still matches.
+    attio._request.return_value = {
+        "data": {"values": {"email_campaign_stage": [{"value": "email1_sent"}]}}
+    }
+
     result = run_wave2_blast(attio, resend, dry_run=False, auto_confirm=True)
 
-    assert result == {"sent": 1, "collisions": 0, "suppressed": 0}
+    assert result == {"sent": 1, "collisions": 0, "suppressed": 0, "send_guard_skipped": 0,
+        "already_sent_repaired": 0, "repair_failed": 0}
     resend.send_email.assert_called_once()
     attio.update_person.assert_called_once()
     update_args = attio.update_person.call_args[0]
@@ -98,7 +92,8 @@ def test_collision_takes_precedence_over_suppression(
 
     result = run_wave2_blast(attio, resend, dry_run=False, auto_confirm=True)
 
-    assert result == {"sent": 0, "collisions": 1, "suppressed": 0}
+    assert result == {"sent": 0, "collisions": 1, "suppressed": 0, "send_guard_skipped": 0,
+        "already_sent_repaired": 0, "repair_failed": 0}
     resend.send_email.assert_not_called()
 
 
@@ -125,9 +120,15 @@ def test_mixed_outcomes_counted_independently(
     resend = MagicMock()
     resend.send_email.return_value = {"id": "msg-x"}
 
+    # Phase 3 guard: re-read must confirm stage still matches for rec-clean.
+    attio._request.return_value = {
+        "data": {"values": {"email_campaign_stage": [{"value": "email1_sent"}]}}
+    }
+
     result = run_wave2_blast(attio, resend, dry_run=False, auto_confirm=True)
 
-    assert result == {"sent": 1, "collisions": 1, "suppressed": 1}
+    assert result == {"sent": 1, "collisions": 1, "suppressed": 1, "send_guard_skipped": 0,
+        "already_sent_repaired": 0, "repair_failed": 0}
     resend.send_email.assert_called_once()
     # Only the clean contact gets advanced.
     attio.update_person.assert_called_once()
@@ -156,7 +157,8 @@ def test_dry_run_does_not_send_or_update(
     result = run_wave2_blast(attio, None, dry_run=True, auto_confirm=True)
 
     # Suppressed counted, clean is the only "would-send".
-    assert result == {"sent": 1, "collisions": 0, "suppressed": 1}
+    assert result == {"sent": 1, "collisions": 0, "suppressed": 1, "send_guard_skipped": 0,
+        "already_sent_repaired": 0, "repair_failed": 0}
     attio.update_person.assert_not_called()
 
 

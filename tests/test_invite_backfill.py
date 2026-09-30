@@ -78,6 +78,24 @@ def patched_content():
 
 
 class TestBuildInviteSendData:
+    def test_next_container_excludes_stale_duplicate_url_and_company(self, patched_content):
+        # Attio may return a stale pool after the previous container held
+        # its rows. A second list entry for the same person and a colleague
+        # at the same company must both be excluded before PB sees them.
+        prospects = [_attrs("same-person"), _attrs("colleague"), _attrs("fresh")]
+        attio = _attio_with_companies(
+            {"same-person": "company-1", "colleague": "company-1",
+             "fresh": "company-2"}, set(),
+        )
+        cache = _fake_cache(lambda rid: f"https://linkedin.com/in/{rid}")
+        rows, _ = _build_invite_send_data(
+            prospects, target=10, attio=attio, cache=cache, today=TODAY,
+            audit_logger=None, dry_run=True,
+            seen_company_ids={"company-1"},
+            excluded_linkedin_urls={"https://linkedin.com/in/same-person"},
+        )
+        assert [row["record_id"] for row in rows] == ["fresh"]
+
     def test_backfill_past_throttle_reaches_target(self, patched_content):
         """20 distinct-company prospects, the first 11 throttled. The
         accumulator must SKIP the 11 throttled and keep scanning to fill
@@ -271,7 +289,7 @@ class TestTargetComputation:
                         "missing_url": 0}
         self._run(remaining={"connections": 25, "messages": 30, "visits": 50},
                   batch_size=25, prospects_len=40, spy=spy)
-        assert captured["target"] == 25
+        assert captured["target"] == 10
 
     def test_target_clamped_to_remaining_connections(self):
         captured = {}

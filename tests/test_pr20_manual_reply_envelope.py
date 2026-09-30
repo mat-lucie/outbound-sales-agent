@@ -257,15 +257,15 @@ def test_connection_note_sets_had_connection_note_and_skips_classification():
     pb.wait_for_completion.return_value = MagicMock(status="finished")
     # SN inbox CSV: 1 row from the prospect, short body, totalMessageCount=1.
     csv = (
-        "participantFullName,isLastMessageFromMe,lastMessageBody,totalMessageCount\n"
-        "Test Prospect,false,Gracias por conectar!,1"
+        "participantProfileUrl,participantFullName,isLastMessageFromMe,lastMessageBody,totalMessageCount\n"
+        "https://linkedin.com/in/test,Test Prospect,false,Gracias por conectar!,1"
     )
     pb.download_result_csv.return_value = csv
 
     with patch("workflows.detect_responses.RecordCache.get") as cache_get, \
          patch("workflows.detect_responses.classify_reply_llm") as mock_classify, \
          patch.dict("os.environ", {"ATTIO_LIST_ID": "list-1"}, clear=False):
-        cache_get.return_value = ("Test Prospect", "ACME", "https://x", "", "")
+        cache_get.return_value = ("Test Prospect", "ACME", "https://linkedin.com/in/test", "", "")
         result = detect_responses(attio, pb, "agent-inbox")
 
     assert not mock_classify.called, (
@@ -357,15 +357,15 @@ def test_long_reply_does_not_trigger_connection_note_guard():
     pb.wait_for_completion.return_value = MagicMock(status="finished")
     long_body = "Yes, I'm very interested in learning more about your platform. " * 5
     csv = (
-        "participantFullName,isLastMessageFromMe,lastMessageBody,totalMessageCount\n"
-        f"Test Prospect,false,{long_body},1"
+        "participantProfileUrl,participantFullName,isLastMessageFromMe,lastMessageBody,totalMessageCount\n"
+        f"https://linkedin.com/in/test,Test Prospect,false,{long_body},1"
     )
     pb.download_result_csv.return_value = csv
 
     with patch("workflows.detect_responses.RecordCache.get") as cache_get, \
          patch("workflows.detect_responses.classify_reply_llm") as mock_classify, \
          patch.dict("os.environ", {"ATTIO_LIST_ID": "list-1"}, clear=False):
-        cache_get.return_value = ("Test Prospect", "ACME", "https://x", "", "")
+        cache_get.return_value = ("Test Prospect", "ACME", "https://linkedin.com/in/test", "", "")
         mock_classify.return_value = {
             "classification": "positive",
             "reasoning": "test", "defensive_score": 0.0,

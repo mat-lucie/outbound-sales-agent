@@ -1512,9 +1512,11 @@ class TestDailyEntrypointMultipleRunningGuard:
             raise MultipleRunningExperimentsError(("exp-001", "exp-002"))
 
         monkeypatch.setattr(model_mod, "get_current_experiment_id", _raise)
+        monkeypatch.setattr("workflows.safety_limits.get_status", lambda: "offline")
+        monkeypatch.setattr("workflows.run_provenance.assert_checkout_current", lambda **_k: {})
 
         runner = CliRunner()
-        result = runner.invoke(cli, ["daily", "--dry-run", "--yes"])
+        result = runner.invoke(cli, ["daily", "--yes"])
         assert result.exit_code == 1, (
             f"daily must exit 1 on MultipleRunningExperimentsError, got "
             f"{result.exit_code}. Output:\n{result.output}"

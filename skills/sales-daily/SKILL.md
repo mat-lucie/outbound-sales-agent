@@ -1,76 +1,79 @@
 ---
 name: sales-daily
-description: Run the daily sales check. Phase A = invites (every day), Phase B = DM sequencing (Mon-Fri only). Includes pipeline-starvation evaluation. Skipped under --dry-run.
+description: Run attended acceptance and reply checks, confirmed invitations, reviewed weekday DMs, and a read-only follow-up radar.
 ---
 
 # /sales-daily
 
-Operator-invoked slash command that replaces the daily 9am cron. The
-operator runs this each business day; the daily cap policy and
-weekend gate are enforced inside the Python entry point.
+Use a current checkout with configured operator content and CRM. This skill is
+attended: it never schedules a run or grants send permission.
+
+## Read-only preview
+
+Run `sales daily --dry-run`. It queries pipeline inventory only: no scrapes,
+Sheets or CRM writes, execution locks, cookie probes, daily ledger, LLM calls
+or follow-up detection. Counts are cadence inventory; identities, copy and
+live delivery eligibility remain unchecked. Verify read access for this preview;
+do not perform a create/delete canary.
 
 ## Step 0 — Verify Attio MCP scope
 
-Before touching any Attio data, confirm read+list+write+delete scope:
+Read the operator's sales program. Confirm the intended sender, channels,
+batch and current send authorization. Verify the installed CRM connector's
+documented read/list/write/delete capabilities with the configured canary.
+Halt on incomplete scope with `mcp_scope_insufficient`.
 
-1. Call `whoami` on the Attio MCP — non-error response required.
-2. Call `list-lists` — non-error response required.
-3. Create a sentinel note on the canary Person record, then delete it.
+Resolve open P0 alarms in the Operator Review Queue before DMs. An unavailable
+queue is a halt. Acceptance and reply detection must run before sends; use
+verified profile identity. A participant name does not establish identity.
+Review exact recipients and rendered copy. `--yes` skips the prompt after
+review; it never supplies authorization.
 
-On any failure, halt and escalate `mcp_scope_insufficient` directly to
-the user. Do not proceed to the daily run if scope is incomplete.
+`sales daily --skip-dms --preview-dms-after-invites` sends approved invitations
+and then rehearses DMs with the shared cache. It is a live invitation run.
 
-## Step 1 — Verify Data Quality halt gate
+## Attended LLM dispatch
 
-Before any DM send, check for open P0 alarms in the Operator Review
-Queue. Filter `type IN (cohort_tagging_regression,
-write_owner_invariant_violated, migration_idempotency_regression)`
-AND `status='open'`. If any row exists, halt with the slug list
-visible and tell the operator the recovery path (Attio → Operator
-Review Queue → resolve or dismiss the row).
+Use the attending agent's native subagent capabilities within the configured
+budget. Never enable an API-key fallback. For Codex, initialize a private session
+with `python -m workflows.codex_dispatch init <private-parent>`. Set
+`OUTBOUND_USE_LLM_DISPATCH=1` and `OUTBOUND_LLM_DISPATCH_SESSION=<session>`
+only in the engine child. Keep the parent available to service typed requests
+using the bounded `wait` command. Submit explicit success/error results with
+`respond`; honor expiry and never answer a request twice.
 
-## Step 2 — Run the daily check
+Stop/wait for the child, confirm an empty inbox, and `close` the session.
+Never reuse closed sessions or export dispatch globally. Claude's inbox/outbox
+transport remains supported. See `docs/llm_dispatch_skill_handoff.md`.
 
-Invoke:
+## Execute and reconcile
 
-```bash
-sales daily
-```
+The daily run detects accepts and replies, performs optional event/email
+ingestion, checks starvation, delivers invitations, sequences DMs and builds
+the read-only warm follow-up radar. Invites run any day; DMs run Monday–Friday.
+`--force-weekend` overrides only the DM calendar gate; `--skip-followups`
+skips the radar.
 
-Options:
-- `--dry-run` — preview only, skips PB launches AND skips the
-  pipeline-starvation check (to avoid opening alarm rows during
-  rehearsals).
-- `--force-weekend` — override the Mon-Fri DM rule (rarely needed).
-- `--skip-dms` — invites only.
+Acceptance monitoring occurs in Phase 0. Never replay already-invited contacts
+through Network Booster as acceptance checks. Network Booster launches at most
+10 new invites at a time, draining eligible capacity under one daily ledger.
+Only exact provider-confirmed recipients advance; unconfirmed rows remain held
+for reconciliation. DM tails drain under a bounded launch cap.
 
-**Weekend policy.** Saturday and Sunday: invites are allowed, DMs are
-skipped automatically. `--force-weekend` overrides ONLY the DM gate.
-Per the operator-policy memory entry, weekend runs should normally
-be invites-only.
+Report queued, provider-confirmed, CRM-advanced and failed counts separately.
+A successful health probe or canary is not delivery proof. Inspect the run
+summary and failure details before declaring completion.
 
-The script will:
-1. Phase 0 — detect newly-accepted connection requests.
-2. Phase 0.5 — detect responses to DMs.
-3. Pipeline-starvation check (`evaluate_pipeline_starvation`) — opens
-   a typed queue row if any of the three triggers fire.
-4. Part A — send connection requests with quarantine + degree-check
-   gates.
-5. Part B — DM1/DM2/DM3 sequencing (Mon-Fri only).
+## Follow-up review
 
-## LLM dispatch budgets
+Review the radar by cadence and who owes the next action. Use incremental Gmail
+inventory when email evidence is needed; preserve incomplete-read errors.
+A missing thread does not prove there is no reply. Fresh meeting commitments
+may be included when the configured meeting source is available.
+See `references/followup-review.md` for the review checklist.
 
-Per §3.7, `industry_classification`, `borderline_verdict`,
-`synthetic_prescreen`, `weekly_brain_critique`, `company_hq_classifier`,
-`synth_holdout`, `diagnostic_critique`, and the Haiku qualifier
-execute as Claude Code subagent dispatches from this parent skill —
-no Anthropic API key in any engine process. On `cost_ceiling_breached`,
-this skill halts the affected step and logs the typed escalation; the
-remainder of the daily run continues if the step is non-critical.
-
-## Idempotency
-
-Per-machine flock (`workflows/run_lock.py`) prevents concurrent runs
-of `sales-daily` on the same machine. The Attio `daily_run` object
-prevents concurrent runs across machines on the same `(run_date,
-machine_id)` key. Exit code 75 (EX_TEMPFAIL) on lock contention.
+Every follow-up requires verified identity, current evidence, exact copy review
+and send authorization. The radar and inventory do not send or create drafts.
+A local lock and machine-keyed CRM ledger prevent duplicate execution. Lock
+contention exits 75; template refusal exits 78 with honest partial counts.
+Never reset a hold, gate or ledger to force a rerun.

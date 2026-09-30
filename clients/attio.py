@@ -15,6 +15,7 @@ import httpx
 
 from models.pipeline import STAGE_RANK, PipelineStage
 from models.resolution import LANGUAGE_OVERRIDE_READ_FAILED
+from workflows.run_evidence import observed, timed_call
 
 logger = logging.getLogger(__name__)
 
@@ -40,39 +41,14 @@ def request_with_retry(
     path: str,
     *,
     attempts: int = 5,
-    recheck: Callable[[], dict | None] | None = None,
+    recheck=None,
     **kwargs,
 ) -> dict:
-    """Bounded jittered-exponential retry around ``attio._request``.
+    """Retry safe operations; reconcile ambiguous creates once without replay.
 
-    ``_request`` already retries 429/502/503 and connection errors internally,
-    but a transient **500** raises on the first attempt (unless a caller opts
-    into ``retry_500`` — the operator_review_queue writes deliberately do NOT,
-    they route through this wrapper instead so the recheck below can guard the
-    non-idempotent create). That class crashed the daily run mid-Part-A three
-    times on operator_review_queue writes (PR-259), each time before any
-    invites were sent, forcing full re-runs. This wrapper covers 500s and also
-    survives ``_request`` exhausting its own inner retries.
-
-    Retries ONLY on transient failure classes:
-      - ``httpx.HTTPStatusError`` with a 5xx status
-      - ``httpx.TransportError`` (connection/read/timeout errors)
-    4xx and non-httpx exceptions propagate immediately — retrying a caller bug
-    can't fix it and would mask it.
-
-    ``recheck``: optional zero-arg callable invoked before each RETRY (never
-    before the first attempt). If it returns a non-None dict, that value is
-    returned instead of re-issuing the request. This is the safety valve for
-    non-idempotent writes: a create whose response was lost to a 500/timeout
-    may still have committed server-side, and blindly re-POSTing would
-    duplicate it — the recheck lets the caller probe for the landed write first
-    (escalation._create_row passes a uniqueness_key lookup).
-
-    Module-level rather than a method deliberately: escalation tests drive a
-    bare ``MagicMock()`` client, which would silently auto-mock a
-    ``request_with_retry`` METHOD (returning a MagicMock, bypassing the retry
-    logic and ``_request`` entirely). As a free function the real retry loop
-    always runs, exercised against the mocked ``_request``.
+    A recheck can return a confirmed landed record. A miss or failed probe
+    does not prove absence (the original write may still be committing),
+    so ambiguity propagates instead of authorizing another POST.
     """
     if attempts < 1:
         raise ValueError(f"attempts must be >= 1, got {attempts}")
@@ -83,11 +59,21 @@ def request_with_retry(
                 return found
         try:
             return attio._request(method, path, **kwargs)
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code < 500 or attempt == attempts - 1:
+        except (AmbiguousAttioWrite, httpx.HTTPStatusError, httpx.TransportError) as exc:
+            if isinstance(exc, AmbiguousAttioWrite) or _ambiguous_failure(method, path, exc):
+                ambiguous = exc if isinstance(exc, AmbiguousAttioWrite) else AmbiguousAttioWrite(method, path)
+                if recheck is not None:
+                    try:
+                        found = recheck()
+                    except Exception as probe_error:
+                        raise ambiguous from probe_error
+                    if found is not None:
+                        return found
+                if isinstance(exc, AmbiguousAttioWrite):
+                    raise
+                raise ambiguous from exc
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500:
                 raise
-            status = str(exc.response.status_code)
-        except httpx.TransportError as exc:
             if attempt == attempts - 1:
                 raise
             status = type(exc).__name__
@@ -111,6 +97,34 @@ class AttioResultTruncated(RuntimeError):
     (PR-234: suppression sweeps, per-stage campaign queries, and list-scan
     exports must not drop the tail past their fetch ceiling).
     """
+
+
+class AmbiguousAttioWrite(RuntimeError):
+    """A write may have committed; reconcile before issuing another create."""
+
+    def __init__(self, method: str, path: str):
+        super().__init__(
+            f"ambiguous Attio write: {method} {path}; outcome unknown. "
+            "Reconcile the existing record before retrying; no automatic replay."
+        )
+
+
+def _retry_safe(method: str, path: str) -> bool:
+    # Attio query endpoints are POST reads. Do not infer safety from retry_500.
+    return method.upper() in {"GET", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"} or (
+        method.upper() == "POST"
+        and re.fullmatch(r"/(?:objects/[^/]+/records|lists/[^/]+/entries)/query", path) is not None
+    )
+
+
+def _ambiguous_failure(method: str, path: str, exc: Exception) -> bool:
+    if _retry_safe(method, path):
+        return False
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return isinstance(exc, httpx.TransportError) and not isinstance(
+        exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+    )
 
 
 def _is_stage_regression(prior_stage: str, new_stage: str) -> bool:
@@ -539,6 +553,7 @@ class AttioClient:
         """
         return self._field_mapping.get(engine_field, engine_field)
 
+    @observed("attio.request", "api")
     def _request(
         self,
         method: str,
@@ -548,28 +563,36 @@ class AttioClient:
         retry_500: bool = False,
         **kwargs,
     ) -> dict:
-        # retry_500 is OPT-IN and only for idempotent call sites (reads,
-        # linkedin-keyed assert upserts): Attio 500s are transient in practice
-        # (PR-256 weekly-finalize crash loop), but a 500 on a non-idempotent
-        # POST (note/record create) may have committed server-side, so blanket
-        # retry would risk double-writes.
+        if retries < 1:
+            raise ValueError("retries must be >= 1")
         retryable = (429, 500, 502, 503) if retry_500 else (429, 502, 503)
+        safe = _retry_safe(method, path)
         for attempt in range(retries):
             try:
-                resp = self._client.request(method, path, **kwargs)
-                if resp.status_code in retryable:
-                    if attempt < retries - 1:
-                        time.sleep(2 ** attempt * 5)
+                resp = timed_call("attio.http", "api_service", self._client.request, method, path, **kwargs)
+                if not safe and resp.status_code >= 500:
+                    try:
+                        resp.raise_for_status()
+                    except httpx.HTTPStatusError as exc:
+                        raise AmbiguousAttioWrite(method, path) from exc
+                if resp.status_code in retryable and attempt < retries - 1:
+                    timed_call("attio.backoff", "retry_wait", time.sleep, 2 ** attempt * 5)
                     continue
                 resp.raise_for_status()
-                return resp.json() if resp.content else {}
-            except (httpx.ReadTimeout, httpx.ReadError, httpx.ConnectError):
+                try:
+                    return resp.json() if resp.content else {}
+                except ValueError as exc:
+                    if not safe:
+                        raise AmbiguousAttioWrite(method, path) from exc
+                    raise
+            except httpx.TransportError as exc:
+                if _ambiguous_failure(method, path, exc):
+                    raise AmbiguousAttioWrite(method, path) from exc
                 if attempt < retries - 1:
-                    time.sleep(2 ** attempt * 5)
+                    timed_call("attio.backoff", "retry_wait", time.sleep, 2 ** attempt * 5)
                     continue
                 raise
-        resp.raise_for_status()
-        return {}
+        raise AssertionError("unreachable")
 
     # ── People records ────────────────────────────────────────
 
@@ -692,6 +715,26 @@ class AttioClient:
                     continue
                 yield i, record
 
+    def _bulk_query_subset(self, object_slug: str, record_ids: set[str]) -> dict[str, dict]:
+        """Read full pages instead of thousands of individual record GETs.
+
+        Only requested records leave this helper. Missing IDs still get an
+        individual read (including records created while pages were read).
+        This cache is invocation-local; mutable send guards keep live reads.
+        """
+        records = self._query_paginated(
+            f"/objects/{object_slug}/records/query", None, 50_000,
+            fail_if_truncated=True,
+        )
+        found = {}
+        for record in records:
+            rid = record["id"]["record_id"]
+            if rid in record_ids:
+                if rid in found:
+                    raise ValueError("duplicate record in Attio bulk query")
+                found[rid] = record
+        return found
+
     def bulk_fetch_persons_by_record_ids(
         self, record_ids: set[str], max_workers: int = 8,
         *, metrics: Any = None,
@@ -729,8 +772,18 @@ class AttioClient:
             )
 
         result: dict[str, dict] = {}
+        if len(ids) >= 100:
+            try:
+                result = self._bulk_query_subset("people", record_ids)
+            except (httpx.HTTPError, AttioResultTruncated, KeyError, TypeError, ValueError) as exc:
+                message = f"bulk people query failed ({type(exc).__name__}); falling back to individual reads"
+                print(f"WARNING: {message}", file=sys.stderr)
+                if metrics is not None:
+                    metrics.warn(message)
+            if metrics is not None:
+                metrics.bulk_fetch_records_returned += len(result)
         for rid, record in self._bulk_fetch_fail_open(
-            ids, lambda r: self.get_person(r, retry_500=False),
+            [rid for rid in ids if rid not in result], lambda r: self.get_person(r, retry_500=False),
             on_error, max_workers,
         ):
             if record is not None:
@@ -1548,6 +1601,9 @@ class AttioClient:
             # Select-type attributes store value under option.title
             if item.get("attribute_type") == "select":
                 return item.get("option", {}).get("title")
+            # Record references expose their ID directly, without a value key.
+            if item.get("target_record_id"):
+                return item["target_record_id"]
             return item.get("value", item)
         return None
 
@@ -1651,8 +1707,38 @@ class AttioClient:
             )
 
         primed = 0
+        queried = {}
+        if len(todo) >= 100:
+            try:
+                queried = self._bulk_query_subset("companies", set(todo))
+            except (httpx.HTTPError, AttioResultTruncated, KeyError, TypeError, ValueError) as exc:
+                message = f"bulk company query failed ({type(exc).__name__}); falling back to individual reads"
+                print(f"WARNING: {message}", file=sys.stderr)
+                if metrics is not None:
+                    metrics.warn(message)
+        for cid, record in queried.items():
+            try:
+                self._prime_company(cid, record.get("values", {}))
+            except (KeyError, TypeError, AttributeError, IndexError) as exc:
+                # Parsing can populate display fields before corruption
+                # detection raises. Do not let partial caches hide the ID
+                # from the individual repair loop below.
+                for cache in (self._company_cache, self._industry_cache,
+                              self._company_corruption_cache):
+                    cache.pop(cid, None)
+                message = (
+                    f"bulk company query parse failed for {cid}: "
+                    f"{type(exc).__name__}; retrying individually"
+                )
+                print(f"WARNING: {message}", file=sys.stderr)
+                if metrics is not None:
+                    metrics.warn(message)
+                continue
+            primed += 1
+            if metrics is not None:
+                metrics.bulk_fetch_companies_returned += 1
         for cid, record in self._bulk_fetch_fail_open(
-            todo, lambda c: self.get_company(c, retry_500=False),
+            [cid for cid in todo if cid not in self._company_cache], lambda c: self.get_company(c, retry_500=False),
             on_error, max_workers,
         ):
             # Primes on the calling thread — pool workers only fetch.

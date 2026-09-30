@@ -2,31 +2,36 @@
 
 The SN Inbox Scraper returns Sales Navigator URLs (linkedin.com/sales/people/...)
 which don't match the vanity URLs stored in Attio (linkedin.com/in/...).
-Matching is done by participant name instead.
+Only verified profile identities may match; unbridged URLs are held for review.
 """
 
 import contextlib
 import csv
+import fcntl
 import hashlib
 import io
 import json
 import os
+import re
 import tempfile
 import traceback
 import unicodedata
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import unquote, urlsplit
 
 import click
 import httpx
 
-from clients.attio import AttioClient
+from clients.attio import AttioClient, linkedin_identity_key
 from clients.phantombuster import PhantomBusterClient
+from workflows.run_evidence import observed
 
 if TYPE_CHECKING:
     from clients.resend_client import ResendClient
     from workflows.daily_run import DailyRun
+from clients.google_sheets import write_identity_batch
 from models.campaign import (
     Language,
     MessageStep,
@@ -39,8 +44,10 @@ from models.campaign import (
 from models.pipeline import STAGE_RANK, PipelineStage
 from workflows.daily_check_helpers import (
     SEND_CHANNEL_BOTDOG,
+    _fresh_csv_name,
     _pb_session_args,
     _resolve_send_channel,
+    build_sales_nav_launch_args,
 )
 from workflows.escalation import escalate
 from workflows.hot_lead_alert import (
@@ -211,9 +218,286 @@ _TERMINAL_STAGES_FOR_DRIFT = {
 }
 
 
+def _profile_identity(raw: str, *, identity_bridge: dict[str, str] | None = None) -> str:
+    """Validate a profile URL before using the canonical identity helper.
+
+    Sales Navigator IDs are opaque and case-sensitive. They only match an
+    explicitly stored Sales Navigator URL; a display name is never a bridge
+    to a vanity profile.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    raw = raw.strip()
+    try:
+        url = urlsplit(raw if "://" in raw else "https://" + raw)
+        if url.scheme.lower() not in {"http", "https"} or url.hostname not in {
+            "linkedin.com", "www.linkedin.com",
+        } or url.username or url.password or url.port:
+            return ""
+    except ValueError:
+        return ""
+    parts = unquote(url.path).strip("/").split("/")
+    if any(not part or any(c.isspace() for c in part) for part in parts):
+        return ""
+    if len(parts) == 2 and parts[0].lower() == "in":
+        key = linkedin_identity_key("https://linkedin.com/in/" + parts[1])
+        return identity_bridge.get(key, key) if identity_bridge else key
+    if len(parts) == 3 and parts[0] == "sales" and parts[1] in {"people", "lead"}:
+        profile_id = parts[2].split(",", 1)[0]
+        key = "li-sales:" + profile_id if re.fullmatch(r"[A-Za-z0-9_-]+", profile_id) else ""
+        return identity_bridge.get(key, key) if identity_bridge else key
+    return ""
+
+
+def _valid_public_identity_key(key: str) -> bool:
+    """Accept only canonical LinkedIn person identities in operator evidence."""
+    if re.fullmatch(r"li-id:\d{6,}", key):
+        return True
+    return key.startswith("https://linkedin.com/in/") and _profile_identity(key) == key
+
+
+def _load_verified_identity_bridge(path: str) -> dict[str, str]:
+    """Load an operator-reviewed Sales Nav/public URL evidence manifest.
+
+    The file is a private operational input, never an inferred name join. Each
+    row has a provider or live-UI provenance; CRM aliases require an explicit
+    observed redirect. Duplicate/contradictory identities fail closed.
+    """
+    if not path:
+        return {}
+    required = {"sales_id", "public_key", "public_url", "crm_alias_key",
+                "crm_alias_evidence", "provenance"}
+    bridge: dict[str, str] = {}
+    public_owners: dict[str, str] = {}
+    aliases: list[tuple[str, str]] = []
+    with open(path, newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        if not reader.fieldnames or not required.issubset(reader.fieldnames):
+            raise ValueError("identity manifest is missing required columns")
+        for row in reader:
+            if None in row:
+                raise ValueError("identity manifest has extra columns")
+            sales_id = (row["sales_id"] or "").strip()
+            public_key = (row["public_key"] or "").strip()
+            public_url = (row["public_url"] or "").strip()
+            alias = (row["crm_alias_key"] or "").strip()
+            alias_evidence = (row["crm_alias_evidence"] or "").strip()
+            if (not re.fullmatch(r"[A-Za-z0-9_-]+", sales_id)
+                    or not _valid_public_identity_key(public_key)
+                    or not (row["provenance"] or "").strip()):
+                raise ValueError("identity manifest has invalid or unproven identity")
+            if not public_url or _profile_identity(public_url) != public_key:
+                raise ValueError("identity manifest public URL conflicts with its key")
+            if bool(alias) != bool(alias_evidence):
+                raise ValueError("identity manifest CRM alias lacks redirect evidence")
+            if alias and (not _valid_public_identity_key(alias) or alias == public_key):
+                raise ValueError("identity manifest has invalid CRM alias")
+            sales_key = "li-sales:" + sales_id
+            if sales_key in bridge or public_key in public_owners:
+                raise ValueError("identity manifest duplicates a Sales Nav or public identity")
+            bridge[sales_key] = public_key
+            public_owners[public_key] = sales_key
+            if alias:
+                aliases.append((alias, public_key))
+    if not bridge:
+        raise ValueError("identity manifest is empty")
+    for alias, public_key in aliases:
+        if alias in public_owners or (alias in bridge and bridge[alias] != public_key):
+            raise ValueError("identity manifest CRM alias conflicts with another identity")
+        bridge[alias] = public_key
+    return bridge
+
+
+def _enrich_missing_inbox_identities(
+    pb: PhantomBusterClient,
+    manifest_path: str,
+    missing: dict[str, str],
+    scraper_id: str,
+) -> None:
+    """Persist only exact Sales Navigator/public-profile pairs from this PB launch."""
+    if not scraper_id:
+        raise ValueError("PB_SALES_NAV_PROFILE_SCRAPER_ID is required for new inbox identities")
+    if not missing:
+        return
+    if len(missing) > 50:
+        raise ValueError("More than 50 new inbox identities need operator review before scraping")
+
+    for key, url in missing.items():
+        if _profile_identity(url) != key:
+            raise ValueError("Requested Sales Navigator identity does not match its URL")
+    from models.business_calendar import operator_today
+
+    today = operator_today()
+    deferred_path = Path(manifest_path + ".deferred.json")
+    deferred = json.loads(deferred_path.read_text()) if deferred_path.exists() else {}
+    if not isinstance(deferred, dict):
+        raise ValueError("Invalid deferred identity evidence")
+    held = [key for key in missing if key in deferred
+            and date.fromisoformat(deferred[key]["retry_on"]) > today]
+    if held:
+        raise ValueError(f"Inbox identities deferred until tomorrow: {', '.join(held)}")
+    csv_name = _fresh_csv_name("inbox-identity")
+    spreadsheet_url = write_identity_batch(list(missing.values()))
+    arguments = build_sales_nav_launch_args(
+        pb, scraper_id, spreadsheet_url=spreadsheet_url, launch_count=len(missing),
+    )
+    arguments["csvName"] = csv_name
+    launch = pb.launch_agent(scraper_id, arguments)
+    evidence_ref = f"{', '.join(missing)}, PB container {launch.container_id}"
+    try:
+        pb.wait_for_completion(launch, poll_interval=15, max_wait=900)
+        result_csv = pb.download_result_csv(launch, csv_name=csv_name)
+    except Exception as exc:
+        raise RuntimeError(f"Sales Navigator identity provider failed ({evidence_ref}): {exc}") from exc
+    if not result_csv:
+        raise ValueError(f"Sales Navigator identity scrape returned no CSV ({evidence_ref})")
+    queries = {url: key for key, url in missing.items()}
+    pairs: dict[str, tuple[str, str]] = {}
+    invalid: set[str] = set()
+    unavailable: dict[str, dict[str, str]] = {}
+    for row in csv.DictReader(io.StringIO(result_csv)):
+        query = (row.get("query") or "").strip()
+        if query not in queries:
+            raise ValueError(f"Sales Navigator identity scrape returned an unexpected query ({evidence_ref})")
+        key = queries[query]
+        if row.get("error"):
+            unavailable[key] = {
+                "query": query, "container_id": launch.container_id,
+                "error": row["error"], "retry_on": (today + timedelta(days=1)).isoformat(),
+            }
+        echoed = (row.get("salesNavigatorUrl") or "").strip()
+        public_url = (row.get("linkedinProfileUrl") or "").strip()
+        public_key = _profile_identity(public_url)
+        if (row.get("error") or echoed and _profile_identity(echoed) != key
+                or not _valid_public_identity_key(public_key)
+                or not public_url.startswith(("https://linkedin.com/in/", "https://www.linkedin.com/in/"))):
+            invalid.add(key)
+            continue
+        pair = (public_key, public_url)
+        if key in pairs and pairs[key] != pair:
+            raise ValueError(f"Sales Navigator identity scrape returned conflicting identities ({evidence_ref})")
+        pairs[key] = pair
+    # Reject conflicting batch ownership before any checkpoint. Failed/missing
+    # profiles keep the send gate closed, but exact independent pairs survive.
+    owners: dict[str, str] = {}
+    for key, (public_key, _) in pairs.items():
+        if public_key in owners and owners[public_key] != key:
+            raise ValueError(f"Sales Navigator identity scrape returned conflicting identities ({evidence_ref})")
+        owners[public_key] = key
+    for key, pair in pairs.items():
+        if key in invalid:
+            continue
+        try:
+            _append_verified_inbox_identity(manifest_path, key, *pair, launch.container_id)
+        except Exception as exc:
+            raise RuntimeError(f"Sales Navigator identity checkpoint failed ({evidence_ref}): {exc}") from exc
+    if unavailable:
+        # This evidence delays another scrape; it never resolves identity or
+        # authorizes a DM. Keep exact provider errors private and atomic.
+        deferred.update(unavailable)
+        with tempfile.NamedTemporaryFile(mode="w", dir=deferred_path.parent, delete=False) as handle:
+            temporary = handle.name
+            try:
+                os.fchmod(handle.fileno(), 0o600)
+                json.dump(deferred, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+                os.replace(temporary, deferred_path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+    if invalid:
+        raise ValueError(f"Sales Navigator identity scrape returned invalid provider evidence ({evidence_ref})")
+    if set(pairs) != set(missing):
+        raise ValueError(f"Sales Navigator identity scrape is missing requested IDs ({evidence_ref})")
+
+
+def _append_verified_inbox_identity(
+    manifest_path: str, key: str, public_key: str, public_url: str, container_id: str,
+) -> None:
+    """Checkpoint one verified pair without opening the downstream send gate."""
+
+    # Serialize cooperating sales processes. Operators must not manually edit
+    # this file during a daily run; the digest recheck only narrows that race.
+    lock_path = manifest_path + ".lock"
+    with open(lock_path, "a+", encoding="utf-8") as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        with open(manifest_path, "rb") as handle:
+            original_digest = hashlib.sha256(handle.read()).digest()
+        with open(manifest_path, newline="", encoding="utf-8-sig") as handle:
+            reader = csv.DictReader(handle)
+            fields = reader.fieldnames
+            rows = list(reader)
+        bridge = _load_verified_identity_bridge(manifest_path)
+        if key in bridge or public_key in bridge.values():
+            raise ValueError("Sales Navigator identity scrape conflicts with the manifest")
+        rows.append({
+            "sales_id": key.removeprefix("li-sales:"),
+            "public_key": public_key,
+            "public_url": public_url,
+            "crm_alias_key": "",
+            "crm_alias_evidence": "",
+            "provenance": f"phantombuster_sn_profile_scraper_container_{container_id}",
+        })
+        fd, temp_path = tempfile.mkstemp(prefix=".inbox-identity-", suffix=".csv",
+                                         dir=str(Path(manifest_path).parent))
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields or [])
+                writer.writeheader()
+                writer.writerows(rows)
+            _load_verified_identity_bridge(temp_path)
+            with open(manifest_path, "rb") as handle:
+                if hashlib.sha256(handle.read()).digest() != original_digest:
+                    raise ValueError("Identity manifest changed during update; retry after review")
+            os.replace(temp_path, manifest_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+
+def _resolve_thread_entries(
+    row: dict, name_index: dict[str, list[dict]], *, counts: dict | None = None,
+    identity_bridge: dict[str, str] | None = None,
+) -> list[dict]:
+    """Resolve across the entire index so renamed profiles still match.
+
+    Names only identify candidates for a visible hold. Every returned entry
+    independently carries the same verified identity as the scraped thread.
+    Conflicting CRM identity fields are never resolved by choosing one.
+    """
+    identity = _profile_identity(row.get("participantProfileUrl", ""), identity_bridge=identity_bridge)
+    matched = []
+    conflicting = False
+    for entries in name_index.values():
+        for attrs in entries:
+            urls = [attrs[field] for field in ("linkedin_url", "canonical_linkedin_url")
+                    if isinstance(attrs.get(field), str) and attrs[field]]
+            keys = {_profile_identity(url, identity_bridge=identity_bridge) for url in urls}
+            if identity and keys == {identity}:
+                matched.append(attrs)
+            elif identity and identity in keys:
+                conflicting = True
+    if matched and not conflicting:
+        return matched
+    name = row.get("participantFullName", "").strip()
+    if conflicting or name_index.get(_normalize_name(name)):
+        if counts is not None:
+            counts["identity_holds"] = counts.get("identity_holds", 0) + 1
+        click.echo(
+            f"  ⚠ Inbox identity hold: {name!r} has missing, unusable, or "
+            "conflicting profile evidence; no reply/manual-touch/cadence writes.",
+            err=True,
+        )
+    return []
+
+
 def _detect_cadence_drift(
     threads: list[dict],
     name_to_full_pipeline: dict[str, list[dict]],
+    identity_bridge: dict[str, str] | None = None,
 ) -> list[dict]:
     """Cross-reference inbox threads against the full pipeline to surface
     cadence drift (where Attio state disagrees with LinkedIn thread evidence).
@@ -234,7 +518,7 @@ def _detect_cadence_drift(
             total = 0
         is_from_me = row.get("isLastMessageFromMe", "").strip().lower() == "true"
 
-        matched = name_to_full_pipeline.get(_normalize_name(participant_name)) or []
+        matched = _resolve_thread_entries(row, name_to_full_pipeline, identity_bridge=identity_bridge)
         for attrs in matched:
             cur_stage = attrs.get("stage") or ""
             cur_step = int(attrs.get("dm_step") or 0)
@@ -1264,6 +1548,7 @@ def _detect_manual_touches(
     today_iso: str,
     counts: dict,
     state_path: Path | None = None,
+    identity_bridge: dict[str, str] | None = None,
 ) -> None:
     """Stamp `last_contact_date` + a "DM manual" note for hand-written DMs
     on RESPONDED entries. See the module comment above for the rules.
@@ -1275,7 +1560,7 @@ def _detect_manual_touches(
       manual_touch_state_unreadable / manual_touch_state_write_failed
                                    — local state file problems (loud)
       manual_touch_guard_offline   — template matcher unavailable → pass skipped
-      manual_touch_ambiguous_name  — name matches several people → row skipped
+      identity_holds             — no verified profile match → row skipped
       manual_touch_date_fallback   — row had no parsable lastMessageDate
       manual_touch_prospect_replied — prospect wrote after a recorded manual
                                    DM → state ball flipped to "theirs"
@@ -1322,14 +1607,14 @@ def _detect_manual_touches(
             if not participant_name or (from_me and not last_body):
                 continue
             candidates = [
-                a for a in name_to_full_pipeline.get(_normalize_name(participant_name), [])
+                a for a in _resolve_thread_entries(
+                    row, name_to_full_pipeline, counts=counts, identity_bridge=identity_bridge)
                 if a.get("stage") == PipelineStage.RESPONDED.value
                 and a.get("entry_id")
                 and not a.get("merged_into")  # §3.11 soft-deleted duplicates
             ]
             if not candidates:
                 continue
-            distinct_people = {str(a.get("record_id") or "") for a in candidates}
             if not from_me:
                 # The prospect wrote last. The CRM can't record this
                 # (RESPONDED entries skip the reply loop), so flip the ball
@@ -1337,18 +1622,6 @@ def _detect_manual_touches(
                 # "ours" — the radar's cold-responder lane must not nudge
                 # someone who just answered. Local state only: no CRM write
                 # and no new state entries.
-                if len(distinct_people) > 1:
-                    # Same guard as the stamp path: we cannot tell whose
-                    # reply this is, and flipping both would silently hide
-                    # the other prospect's cold row until we DM again.
-                    counts["manual_touch_ambiguous_name"] += 1
-                    click.echo(
-                        f"  ⚠ manual-touch: {participant_name!r} matches "
-                        f"{len(distinct_people)} different people at Responded — "
-                        f"reply not attributed; neither entry's ball was flipped.",
-                        err=True,
-                    )
-                    continue
                 observed, fell_back = _manual_touch_date(
                     row.get("lastMessageDate", ""), today_iso,
                 )
@@ -1372,19 +1645,6 @@ def _detect_manual_touches(
             # Our own DM template echoed back is an automated send, not a
             # manual touch — the cadence writers already stamped that one.
             if _looks_like_self_echo(last_body) is not None:
-                continue
-            if len(distinct_people) > 1:
-                # Same normalized name, different people: we cannot tell
-                # which one was written to, and a wrong guess files the
-                # message on a stranger's record. Skip loudly.
-                counts["manual_touch_ambiguous_name"] += 1
-                click.echo(
-                    f"  ⚠ manual-touch: {participant_name!r} matches "
-                    f"{len(distinct_people)} different people at Responded — "
-                    f"skipped so one prospect's DM text is not filed on "
-                    f"another's record. Stamp by hand if needed.",
-                    err=True,
-                )
                 continue
             total_raw = row.get("totalMessageCount", "").strip()
             fingerprint = _manual_touch_fingerprint(last_body, total_raw)
@@ -1512,6 +1772,11 @@ class NoCSVHalt(RuntimeError):
         )
 
 
+class IdentityResolutionHalt(RuntimeError):
+    """Unverified pipeline thread identity blocks downstream DM sequencing."""
+
+
+@observed("replies", "phase")
 def detect_responses(
     attio: AttioClient,
     pb: PhantomBusterClient,
@@ -1523,7 +1788,7 @@ def detect_responses(
     """Phase 0.5: Detect message responses via PB SN Inbox Scraper.
 
     Launches the SN Inbox Scraper phantom (which reads the Sales Navigator inbox),
-    then matches responses back to Attio entries by participant name. Classifies
+    then matches responses back to Attio entries by verified profile identity. Classifies
     replies and updates pipeline stages accordingly.
 
     `cache` may be supplied by the caller to reuse person records pre-fetched
@@ -1577,9 +1842,10 @@ def detect_responses(
         # disagree about which transport owns a row.
         if _resolve_send_channel(attrs) == SEND_CHANNEL_BOTDOG:
             continue
-        name, company, _, _, _ = cache.get(attrs["record_id"])
+        name, company, linkedin_url, _, _ = cache.get(attrs["record_id"])
         if not name:
             continue
+        attrs["linkedin_url"] = linkedin_url
         attrs["prospect_name"] = name
         attrs["company_name"] = company or ""
         dm_prospects.append(attrs)
@@ -1597,35 +1863,17 @@ def detect_responses(
 
     click.echo(f"  Checking {len(dm_prospects)} prospects in DM stages for responses...")
 
-    # Build a name index for matching SN Inbox Scraper results back to Attio
-    # entries. Multiple entries can share a normalized name (e.g. two "Carlos
-    # López" prospects from different companies, or duplicate Attio records for
-    # one person). On a reply match we update *every* entry that shares the
-    # name so no one is silently left stuck in DM stage.
-    name_to_entries: dict[str, list[dict]] = {}
-    for attrs in dm_prospects:
-        norm = _normalize_name(attrs["prospect_name"])
-        name_to_entries.setdefault(norm, []).append(attrs)
+    dm_entry_ids = {attrs["entry_id"] for attrs in dm_prospects}
 
-    collisions = {n: e for n, e in name_to_entries.items() if len(e) > 1}
-    if collisions:
-        click.echo(
-            f"  ⚠ Name collisions: {len(collisions)} name(s) match multiple "
-            f"Attio entries — all matched entries will be updated on reply."
-        )
-        for name, entries in list(collisions.items())[:5]:
-            companies = ", ".join(e.get("company_name", "?") or "?" for e in entries)
-            click.echo(f"      {name} → {len(entries)} entries ({companies})")
-
-    # Build a SECOND name index covering the FULL pipeline (not just DM-stage)
-    # — needed for the cadence drift detector below. Cheap to build here: we
-    # already have all `entries` loaded.
+    # Build a name index covering the full pipeline (not just DM stages) for
+    # identity preflight, reply classification, and cadence drift detection.
     name_to_full_pipeline: dict[str, list[dict]] = {}
     for entry in entries:
         attrs = AttioClient.parse_entry(entry)
-        name, company, _, _, _ = cache.get(attrs["record_id"])
+        name, company, linkedin_url, _, _ = cache.get(attrs["record_id"])
         if not name:
             continue
+        attrs["linkedin_url"] = linkedin_url
         attrs["prospect_name"] = name
         attrs["company_name"] = company or ""
         name_to_full_pipeline.setdefault(_normalize_name(name), []).append(attrs)
@@ -1721,10 +1969,82 @@ def detect_responses(
     # response-detection loop, so we don't re-parse the CSV.
     scraped_threads = list(csv.DictReader(io.StringIO(result_csv)))
 
+    # A local, evidence-backed operator manifest may bridge the opaque Sales
+    # Navigator IDs to public profile URLs. Any malformed or incomplete
+    # manifest must halt before inbox-derived Attio writes.
+    bridge_path = os.environ.get("OUTBOUND_INBOX_IDENTITY_MAP", "")
+    try:
+        identity_bridge = _load_verified_identity_bridge(bridge_path)
+        if bridge_path:
+            if not scraped_threads:
+                raise ValueError("inbox CSV has no thread rows")
+            identities = [
+                _profile_identity(row.get("participantProfileUrl", ""))
+                for row in scraped_threads
+            ]
+            invalid = sum(not key for key in identities)
+            if invalid:
+                raise ValueError(f"{invalid} inbox thread(s) have no usable profile URL")
+            unknown = {
+                key: row.get("participantProfileUrl", "")
+                for key, row in zip(identities, scraped_threads, strict=True)
+                if key.startswith("li-sales:") and key not in identity_bridge
+            }
+            if unknown:
+                _enrich_missing_inbox_identities(
+                    pb, bridge_path, unknown,
+                    os.environ.get("PB_SALES_NAV_PROFILE_SCRAPER_ID", "").strip(),
+                )
+                identity_bridge = _load_verified_identity_bridge(bridge_path)
+                if any(key not in identity_bridge for key in unknown):
+                    raise ValueError("identity manifest remains incomplete after enrichment")
+    except Exception as exc:
+        if daily_run is not None:
+            try:
+                daily_run.set_reply_detection_status("failed")
+            except Exception as patch_exc:
+                click.echo(
+                    "  ⚠ CRITICAL: identity manifest validation failed "
+                    f"({type(exc).__name__}: {exc}); reply status PATCH also failed "
+                    f"({type(patch_exc).__name__}: {patch_exc}). Remote status may be stale; "
+                    "DM sequencing must remain halted until status is repaired.",
+                    err=True,
+                )
+                raise IdentityResolutionHalt(
+                    "Identity manifest failed validation and reply status could not be saved; "
+                    "DM sequencing must remain halted"
+                ) from patch_exc
+        raise IdentityResolutionHalt(f"Identity manifest failed validation: {exc}") from exc
+
     # SN Inbox Scraper columns:
     # participantProfileUrl, participantFullName, isLastMessageFromMe,
     # lastMessageBody, lastMessageDate, totalMessageCount, ...
     counts = _empty_counts()
+    # Preflight the full pipeline before any inbox-derived writes so manual
+    # touches and cadence repairs cannot bypass an unresolved identity hold.
+    preflight_matches = [
+        _resolve_thread_entries(
+            row, name_to_full_pipeline, counts=counts, identity_bridge=identity_bridge)
+        for row in scraped_threads
+    ]
+    if counts.get("identity_holds", 0):
+        message = (
+            f"{counts['identity_holds']} inbox thread(s) have unresolved pipeline "
+            "identity; reply detection and downstream DMs are held."
+        )
+        if daily_run is not None:
+            try:
+                daily_run.set_reply_detection_status("failed")
+            except Exception as exc:
+                # Even persistence failure must halt this process; a previous
+                # remote success cannot authorize continuing the current run.
+                click.echo(
+                    "  ⚠ CRITICAL: identity hold status could not be saved; "
+                    "a previous remote status may be stale. DMs remain halted "
+                    "in this run; repair status before another send run.", err=True,
+                )
+                raise IdentityResolutionHalt(message) from exc
+        raise IdentityResolutionHalt(message)
     # Record IDs the response classifier moved to RESPONDED / NOT_INTERESTED
     # in this run. The cadence auto-repair below must skip these so it
     # doesn't overwrite the classifier's stage decision with a stale
@@ -1736,7 +2056,7 @@ def detect_responses(
     # counts dict shape is public contract for downstream callers.
     classify_escalate_failed_count = 0
 
-    for row in scraped_threads:
+    for row, full_matches in zip(scraped_threads, preflight_matches, strict=True):
         participant_name = row.get("participantFullName", "").strip()
         is_from_me = row.get("isLastMessageFromMe", "").strip().lower()
         last_body = row.get("lastMessageBody", "").strip()
@@ -1745,9 +2065,12 @@ def detect_responses(
         if not participant_name or not last_body:
             continue
 
-        # Match to Attio entries by name (one name can map to multiple entries)
-        norm_name = _normalize_name(participant_name)
-        matched_entries = name_to_entries.get(norm_name)
+        # The full-pipeline preflight already established identity. Filtering
+        # those exact matches to PB DM-stage entries avoids a false hold when
+        # an unrelated DM prospect shares a non-DM thread participant's name.
+        matched_entries = [
+            attrs for attrs in full_matches if attrs.get("entry_id") in dm_entry_ids
+        ]
         if not matched_entries:
             continue
 
@@ -2475,6 +2798,7 @@ def detect_responses(
             name_to_full_pipeline=name_to_full_pipeline,
             today_iso=date.today().isoformat(),
             counts=counts,
+            identity_bridge=identity_bridge,
         )
     except _UnauthorizedManualTouch:
         raise
@@ -2509,7 +2833,8 @@ def detect_responses(
     # Phase 0.5 detected the drift, no one acted on it, Part A flipped 1st-
     # degree prospects to ACCEPTED, Part B sent redundant DM1's on threads
     # that already had 3-5 messages.
-    drifts = _detect_cadence_drift(scraped_threads, name_to_full_pipeline)
+    drifts = _detect_cadence_drift(
+        scraped_threads, name_to_full_pipeline, identity_bridge=identity_bridge)
     counts["drift_detected"] = len(drifts)
     if drifts:
         from datetime import date as _date

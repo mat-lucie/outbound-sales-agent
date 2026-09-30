@@ -981,7 +981,7 @@ class TestWorkerLaunch:
 
 
 class TestEnrichmentLaunch:
-    def test_single_url_uses_ps_enr_namespace(self):
+    def test_single_url_uses_ps_enr_namespace(self, monkeypatch):
         pb = MagicMock()
         pb.download_result_csv.return_value = "linkedinProfileUrl\n"
         with patch(
@@ -990,12 +990,12 @@ class TestEnrichmentLaunch:
                           "numberOfProfilesPerLaunch": 1},
         ) as build_mock:
             _launch_enrichment_scrape(
-                pb, "sn-agent", ["https://linkedin.com/in/rin"],
+                pb, "sn-agent", ["https://linkedin.com/in/ana"],
                 dry_run=False,
             )
         # Bare URL → no sheet write, raw count of 1.
         assert build_mock.call_args.kwargs["spreadsheet_url"] == (
-            "https://linkedin.com/in/rin"
+            "https://linkedin.com/in/ana"
         )
         assert build_mock.call_args.kwargs["launch_count"] == 1
         args = pb.launch_agent.call_args.args[1]
@@ -1006,7 +1006,9 @@ class TestEnrichmentLaunch:
             == args["csvName"]
         )
 
-    def test_multi_url_goes_through_sheet_with_header_count(self):
+    def test_multi_url_goes_through_headerless_sheet(
+        self, monkeypatch
+    ):
         pb = MagicMock()
         pb.download_result_csv.return_value = "linkedinProfileUrl\n"
         urls = [f"https://linkedin.com/in/p{i}" for i in range(3)]
@@ -1023,8 +1025,8 @@ class TestEnrichmentLaunch:
             _launch_enrichment_scrape(pb, "sn-agent", urls, dry_run=False)
         assert sheet_mock.call_args.kwargs["columns"] == ["profileUrl"]
         assert sheet_mock.call_args.kwargs["spreadsheet_id"] is None
-        # +1 header line PB counts as a processable input.
-        assert build_mock.call_args.kwargs["launch_count"] == 4
+        assert sheet_mock.call_args.kwargs["include_header"] is False
+        assert build_mock.call_args.kwargs["launch_count"] == 3
 
     def test_dry_run_multi_url_requires_sandbox_sheet(self, monkeypatch):
         monkeypatch.delenv("GSHEET_DRYRUN_ID", raising=False)
@@ -1283,7 +1285,7 @@ class TestInvitePathPainNoteSelection:
         # the residual re-scan).
         assert set(counts) == {
             "company_throttled", "same_company_run", "missing_language",
-            "language_mismatch", "missing_copy", "missing_url",
+            "language_mismatch", "missing_copy", "missing_url", "send_guard_skipped",
         }
 
     @pytest.mark.parametrize("source_type", ["commenter", "liker"])

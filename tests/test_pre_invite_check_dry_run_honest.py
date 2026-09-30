@@ -55,7 +55,7 @@ def test_dry_run_makes_no_live_calls(monkeypatch):
     # Enable Sales Nav backend to make sure the dry-run guard fires
     # BEFORE the cookie/env check — a missing env var on the live path
     # would raise SalesNavConfigError, masking whether the guard works.
-    monkeypatch.setenv("PRE_INVITE_DEGREE_CHECK_BACKEND", "sales_nav")
+    monkeypatch.setenv("PRE_INVITE_DEGREE_CHECK_BACKEND", "regular")
     monkeypatch.setenv("PB_SALES_NAV_PROFILE_SCRAPER_ID", "phantom-sales-nav-id")
     # Intentionally DO NOT set PB_LI_SALES_NAV_SESSION_COOKIE — if the
     # dry-run guard works, the cookie check is never reached. If the
@@ -151,7 +151,7 @@ def test_sales_nav_health_preflight_skipped_under_dry_run(monkeypatch):
     much scaffolding) and assert quick_check() is not invoked."""
     import os
 
-    monkeypatch.setenv("PRE_INVITE_DEGREE_CHECK_BACKEND", "sales_nav")
+    monkeypatch.setenv("PRE_INVITE_DEGREE_CHECK_BACKEND", "regular")
     # Provide env vars so a regression where the guard fails would
     # actually reach quick_check and launch PB — i.e., we don't want
     # quick_check to short-circuit on missing env (which would mask

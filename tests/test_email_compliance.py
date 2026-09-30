@@ -393,3 +393,12 @@ def test_already_sent_does_not_resend_and_repairs_stage(
     resend.send_email.assert_not_called()
     attio.update_person.assert_called_once()
     assert attio.update_person.call_args[0][1]["email_campaign_stage"] == "email1_sent"
+
+
+@pytest.fixture(autouse=True)
+def _fresh_state_boundary():
+    from unittest.mock import patch
+
+    from workflows.email_send_guard import GuardResult
+    with patch("workflows.daily_check.verify_send_preconditions", return_value=GuardResult(True)), patch("workflows.email_campaign.verify_email_send_preconditions", return_value=GuardResult(True)), patch("workflows.dm_quality_gate.require_clear_dm_quality_queue"):
+        yield

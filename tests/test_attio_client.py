@@ -5,7 +5,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from clients.attio import AttioClient
+from clients.attio import AmbiguousAttioWrite, AttioClient
 
 
 def _http_error(status: int, url: str = "https://api.attio.com/v2/x") -> httpx.HTTPStatusError:
@@ -82,18 +82,15 @@ def _response(status: int, json_body: dict | None = None) -> httpx.Response:
 
 
 class TestRequest500Retry:
-    """Opt-in 500 retry (PR-256 weekly-finalize crash loop).
+    """Opt-in 500 retry (2026-07-18 weekly-finalize crash loop).
 
-    500 stays fatal by default: on a non-idempotent POST (note/record create)
-    the write may have committed server-side, so a blanket retry risks
-    double-writes. Idempotent call sites opt in via retry_500=True.
+    500 stays fatal by default: on a non-idempotent POST (note/record
+    create) the write may have committed server-side, so a blanket retry
+    risks double-writes. Idempotent call sites opt in via retry_500=True.
     """
 
     def test_500_fatal_by_default(self, attio: AttioClient) -> None:
-        with (
-            patch.object(attio._client, "request", return_value=_response(500)) as mock_req,
-            pytest.raises(httpx.HTTPStatusError),
-        ):
+        with patch.object(attio._client, 'request', return_value=_response(500)) as mock_req, pytest.raises(AmbiguousAttioWrite):
             attio._request("POST", "/objects/people/records", json={})
         mock_req.assert_called_once()
 
@@ -107,19 +104,16 @@ class TestRequest500Retry:
         mock_sleep.assert_called_once()
 
     def test_500_raises_after_retries_exhausted(self, attio: AttioClient) -> None:
-        with (
-            patch.object(attio._client, "request", return_value=_response(500)) as mock_req,
-            patch("clients.attio.time.sleep"),
-            pytest.raises(httpx.HTTPStatusError),
-        ):
-            attio._request("POST", "/x", retries=3, retry_500=True)
+        with patch.object(attio._client, "request", return_value=_response(500)) as mock_req, \
+                patch("clients.attio.time.sleep"), pytest.raises(httpx.HTTPStatusError):
+            attio._request("GET", "/x", retries=3, retry_500=True)
         assert mock_req.call_count == 3
 
     def test_502_still_retried_by_default(self, attio: AttioClient) -> None:
         responses = [_response(502), _response(200, {"data": []})]
         with patch.object(attio._client, "request", side_effect=responses) as mock_req, \
                 patch("clients.attio.time.sleep"):
-            data = attio._request("POST", "/x")
+            data = attio._request("GET", "/x")
         assert data == {"data": []}
         assert mock_req.call_count == 2
 
@@ -131,25 +125,19 @@ class TestRequest500Retry:
         assert records == [{"id": "r1"}]
 
     def test_create_person_500_stays_fatal(self, attio: AttioClient) -> None:
-        with (
-            patch.object(attio._client, "request", return_value=_response(500)) as mock_req,
-            pytest.raises(httpx.HTTPStatusError),
-        ):
+        with patch.object(attio._client, 'request', return_value=_response(500)) as mock_req, pytest.raises(AmbiguousAttioWrite):
             attio.create_person({"name": "X"})
         mock_req.assert_called_once()
 
     def test_no_sleep_after_final_attempt(self, attio: AttioClient) -> None:
-        with (
-            patch.object(attio._client, "request", return_value=_response(500)),
-            patch("clients.attio.time.sleep") as mock_sleep,
-            pytest.raises(httpx.HTTPStatusError),
-        ):
-            attio._request("POST", "/x", retries=3, retry_500=True)
+        with patch.object(attio._client, "request", return_value=_response(500)), \
+                patch("clients.attio.time.sleep") as mock_sleep, pytest.raises(httpx.HTTPStatusError):
+            attio._request("GET", "/x", retries=3, retry_500=True)
         assert mock_sleep.call_count == 2  # sleeps between attempts, not before the raise
 
-    # Pin the per-method opt-ins: a future edit dropping retry_500=True from one
-    # of these silently regresses the PR-256 crash-loop fix while the suite
-    # stays green.
+    # Pin the per-method opt-ins: a future edit dropping retry_500=True from
+    # one of these silently regresses the 2026-07-18 crash-loop fix while the
+    # suite stays green.
     def test_get_person_retries_500_by_default(self, attio: AttioClient) -> None:
         responses = [_response(500), _response(200, {"data": {"id": "p1"}})]
         with patch.object(attio._client, "request", side_effect=responses) as mock_req, \
@@ -158,10 +146,7 @@ class TestRequest500Retry:
         assert mock_req.call_count == 2
 
     def test_get_person_opt_out_fails_fast(self, attio: AttioClient) -> None:
-        with (
-            patch.object(attio._client, "request", return_value=_response(500)) as mock_req,
-            pytest.raises(httpx.HTTPStatusError),
-        ):
+        with patch.object(attio._client, 'request', return_value=_response(500)) as mock_req, pytest.raises(httpx.HTTPStatusError):
             attio.get_person("p1", retry_500=False)
         mock_req.assert_called_once()
 
@@ -652,7 +637,7 @@ class TestRequestWithRetry:
     def test_returns_first_success(self, attio: AttioClient) -> None:
         from clients.attio import request_with_retry
         with patch.object(attio, "_request", return_value={"data": "ok"}) as mock_req:
-            assert request_with_retry(attio, "POST", "/x", json={}) == {"data": "ok"}
+            assert request_with_retry(attio, "POST", "/objects/people/records/query", json={}) == {"data": "ok"}
         mock_req.assert_called_once()
 
     def test_retries_5xx_then_succeeds(self, attio: AttioClient) -> None:
@@ -663,7 +648,7 @@ class TestRequestWithRetry:
             patch.object(attio, "_request", side_effect=[err, {"data": "ok"}]) as mock_req,
             patch("clients.attio.time.sleep") as mock_sleep,
         ):
-            assert request_with_retry(attio, "POST", "/x") == {"data": "ok"}
+            assert request_with_retry(attio, "POST", "/objects/people/records/query") == {"data": "ok"}
         assert mock_req.call_count == 2
         mock_sleep.assert_called_once()
 
@@ -675,7 +660,7 @@ class TestRequestWithRetry:
             patch.object(attio, "_request", side_effect=err) as mock_req,
             pytest.raises(httpx.HTTPStatusError),
         ):
-            request_with_retry(attio, "POST", "/x")
+            request_with_retry(attio, "POST", "/objects/people/records/query")
         mock_req.assert_called_once()
 
     def test_recheck_short_circuits_before_retry(self, attio: AttioClient) -> None:
@@ -688,7 +673,7 @@ class TestRequestWithRetry:
             patch("clients.attio.time.sleep"),
         ):
             result = request_with_retry(
-                attio, "POST", "/x", recheck=lambda: {"data": "landed"},
+                attio, "POST", "/objects/people/records/query", recheck=lambda: {"data": "landed"},
             )
         assert result == {"data": "landed"}
         mock_req.assert_called_once()  # never re-issued the write
@@ -700,4 +685,4 @@ class TestRequestWithRetry:
             patch.object(attio, "_request", side_effect=[err, {"data": "ok"}]),
             patch("clients.attio.time.sleep"),
         ):
-            assert request_with_retry(attio, "POST", "/x") == {"data": "ok"}
+            assert request_with_retry(attio, "POST", "/objects/people/records/query") == {"data": "ok"}

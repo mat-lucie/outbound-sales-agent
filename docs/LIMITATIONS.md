@@ -207,20 +207,12 @@ operator-facing setup.
 
 ---
 
-## 8. Loaded content is still the original operator's defaults
+## 8. Shipped content requires configuration
 
-The files the engine loads at runtime (`content/personas.json`,
-`content/messages.json`, `content/emails.json`, `content/targets.json`,
-`sales-program.md`) are the original operator's content, debranded but still
-domain-specific (LATAM manufacturing outreach). The `config/icp.example.yaml`
-template likewise ships the original operator's ICP shape rather than a
-vendor-neutral placeholder.
-
-The `/onboard` skill generates `config/icp.yaml` for your ICP; that overrides
-the shipped example. The `content/` files must be replaced manually for your
-deployment. The shipped repo-root `content/` and `sales-program.md` are
-operator-specific defaults — replace them (and see `examples/acme/` for a
-synthetic worked example) before running in production.
+The runtime content files contain neutral replacement sentinels. Configure your
+own personas, targets, messages, emails, and ICP before production use. The
+`/onboard` skill prepares your configuration; `examples/acme/` provides a
+synthetic worked example. Live sends refuse replacement or blank templates.
 
 ---
 
@@ -236,13 +228,11 @@ operation (see GETTING_STARTED.md §6). Two gaps to be aware of:
   infra** — a CLI repo can't run an internet-reachable service. Until you stand
   those up, you must monitor the unsubscribe inbox and run the CLI to flip each
   opt-out to `UNSUBSCRIBED`.
-- **`email-association` does not apply cross-channel suppression.** Unlike
-  `email-daily`/`email-wave2` (which call `build_suppression_set` and skip
-  LinkedIn-negative / opted-out contacts), `run_association_outreach` takes no
-  Attio client and dedupes only via its own local sent-ledger. A prospect marked
-  `NOT_INTERESTED`/negative on LinkedIn could still receive an association email.
-  Plumbing an Attio client + suppression into the association path is a tracked
-  follow-up; until then, curate the association list manually.
+- **Association outreach needs configured Attio authority.** The CLI now supplies
+  it, applies cross-channel suppression and shared sent state, and shares the
+  email execution lock. Direct library callers that omit an Attio client retain
+  local-only deduplication and must curate suppression manually. Unmatched or
+  ambiguous CRM email identities are held when authority is supplied.
 
 ---
 
@@ -257,6 +247,6 @@ operation (see GETTING_STARTED.md §6). Two gaps to be aware of:
 | Partial workflow migration | Some workflows still use raw `AttioClient` | Follow migration pattern in CONTRACT.md |
 | Botdog transport ships unwired | Optional alternative sender exists but no send path routes to it; the event drain is Attio-only | Wire `BotdogSender` yourself; see GETTING_STARTED.md |
 | Pain-signal lane ships OFF with placeholder keywords | The second supply lane is inert until you write your own keyword registry and approve it | Replace `content/pain_keywords.json`, set `OUTBOUND_PAIN_SIGNAL_ENABLED=1`; see GETTING_STARTED.md |
-| Content is the original operator's | `content/` files need replacement | Replace before production use; P5 will ship neutral defaults |
+| Content requires configuration | `content/` files contain replacement sentinels | Configure before production use |
 | Email one-click unsubscribe / webhook | No hosted endpoint; opt-outs are manual via mailto + `email-unsubscribe` CLI | Operator stands up an HTTP endpoint + Resend webhook for full automation |
-| `email-association` skips suppression | Association emails not gated by cross-channel suppression | Curate the list manually; Attio-client plumbing is a tracked follow-up |
+| Association library callers without Attio | Local-only deduplication cannot establish cross-channel suppression | Use the configured CLI or supply Attio authority explicitly |

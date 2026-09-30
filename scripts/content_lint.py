@@ -57,6 +57,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from workflows.email_compliance import html_to_text  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Public types
 # ---------------------------------------------------------------------------
@@ -451,7 +453,7 @@ _PLACEHOLDER_SENTINEL = "REPLACE_THIS_TEMPLATE"
 def _cold_email_site_link_rule(emails: dict) -> list[Finding]:
     findings: list[Finding] = []
     email1 = emails.get("email1")
-    if email1 is None:
+    if not isinstance(email1, dict):
         return findings
     for lang, content in email1.items():
         if isinstance(content, dict):
@@ -518,14 +520,21 @@ def lint_content(
     # --- emails.json ---
     for email_key, email_val in emails.items():
         if not isinstance(email_val, dict):
+            findings.append(Finding(Severity.BLOCK, "blank-copy", f"emails.{email_key}",
+                                    "Email template must contain language-specific subject and body_html fields."))
             continue
         for lang, content in email_val.items():
             if not isinstance(content, dict):
+                findings.append(Finding(Severity.BLOCK, "blank-copy", f"emails.{email_key}.{lang}",
+                                        "Email language must contain subject and body_html fields."))
                 continue
+            findings.extend(_required_email_fields_rule(content, f"emails.{email_key}.{lang}"))
             for field_name, text in content.items():
                 if not isinstance(text, str):
                     continue
                 location = f"emails.{email_key}.{lang}.{field_name}"
+                if field_name in _REQUIRED_EMAIL_FIELDS:
+                    findings.extend(_blank_copy_rule(text, location))
 
                 # Rule 1: claim-gate (only on body, not subject)
                 if field_name != "subject":
@@ -582,3 +591,48 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def _blank_copy_rule(text: str, location: str) -> list[Finding]:
+    """BLOCK when a subject/body renders to blank text.
+
+    Rendered via ``html_to_text`` (tags stripped, entities unescaped), so
+    markup-only bodies like ``<p>&nbsp;</p>`` count as blank.
+    """
+    if not html_to_text(text):
+        return [Finding(
+            severity=Severity.BLOCK,
+            rule="blank-copy",
+            location=location,
+            detail=(
+                "Renders to blank text (tags stripped, entities unescaped). "
+                "An emptied template would send a blank email; restore the copy."
+            ),
+        )]
+    return []
+
+
+
+def _required_email_fields_rule(content: dict, location: str) -> list[Finding]:
+    """BLOCK when a template is missing ``subject`` or ``body_html``.
+
+    A missing field sends blank (or crashes) at send time, same failure class
+    as an emptied string.
+    """
+    findings: list[Finding] = []
+    for field_name in _REQUIRED_EMAIL_FIELDS:
+        if not isinstance(content.get(field_name), str):
+            findings.append(Finding(
+                severity=Severity.BLOCK,
+                rule="blank-copy",
+                location=f"{location}.{field_name}",
+                detail=(
+                    f"Required field {field_name!r} is missing or not a string. "
+                    "Every email template needs both a subject and a body_html."
+                ),
+            ))
+    return findings
+
+
+
+_REQUIRED_EMAIL_FIELDS = ("subject", "body_html")

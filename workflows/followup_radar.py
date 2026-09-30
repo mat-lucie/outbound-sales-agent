@@ -2263,14 +2263,10 @@ def _trim_with_lane_caps(
     WAITING at ``_WAITING_DRAFT_SLOT_CAP``, COLD_RESPONDER at
     ``_COLD_RESPONDER_SLOT_CAP``).
 
-    The trim decides which candidates the skill layer verifies + drafts, and
-    it is won on raw urgency — but WAITING urgency grows monotonically with
-    days-waiting, so uncapped it would eventually crowd Partner/Owed out of
-    the draft budget (and >2 nudge drafts a day is noise regardless). The cap
-    is a MAXIMUM, not a reservation: WAITING rows still have to earn their
-    slots on urgency, and displaced slots backfill with the next non-WAITING
-    candidates. No limit → no trim (the full digest keeps its own per-lane
-    preview caps).
+    Allocate limited review slots in the same lane order as the digest:
+    Partner, Owed, Waiting, Cold responder, LinkedIn warm, Nudge. Urgency
+    orders candidates within a lane. Caps are maximums, not reservations;
+    displaced slots backfill from later lanes. No limit keeps the full digest.
 
     Returns ``(trimmed, capped_by_lane)`` — the dict counts, per capped lane,
     the rows the CAP specifically displaced (they'd have made the limit
@@ -2283,7 +2279,11 @@ def _trim_with_lane_caps(
         return candidates, capped
     out: list[FollowupCandidate] = []
     taken = dict.fromkeys(_LANE_SLOT_CAPS, 0)
-    for c in candidates:
+    lanes = partition_lanes(candidates)
+    ordered = [c for lane in (
+        "partner", "owed", "waiting", "cold_responder", "linkedin_warm", "nudge"
+    ) for c in sorted(lanes[lane], key=lambda item: item.urgency, reverse=True)]
+    for c in ordered:
         if len(out) >= limit:
             break
         cap = _LANE_SLOT_CAPS.get(c.lane)

@@ -3,11 +3,13 @@
 
 These drive the real function to the Network Booster advance gate and assert the
 branch decision — the safety-critical glue the unit tests don't exercise:
-  - invites-only batch + input-already-processed  -> advance, NO pb_silent_no_op
+  - already-processed batch                        -> advance, NO pb_silent_no_op
   - clean authenticated launch (unreliable NB CSV) -> optimistic per-row advance
   - auth failure (dead cookie, invites NOT sent)   -> NO advance, pb_silent_no_op
-  - MIXED batch (re-check rows present) + marker   -> NO advance (avoid false
-                                                      CONNECTION_SENT), pb_silent_no_op
+
+(The mixed-batch guard cases were deleted 2026-06-10 with the CONNECTION_SENT
+re-check rows — the batch is always invite-only now, so the batch-level
+already-processed marker is unambiguous.)
 """
 from __future__ import annotations
 
@@ -15,7 +17,7 @@ import os
 from datetime import UTC, date, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
-from tests.fakes import fake_daily_run
+from tests.fakes import fake_daily_run, stub_guard_reread
 
 
 def _entry(*, entry_id: str, record_id: str, stage_title: str) -> dict:
@@ -37,14 +39,13 @@ def _entry(*, entry_id: str, record_id: str, stage_title: str) -> dict:
     }
 
 
-def _drive(*, log_output: str, csv_text: str, include_recheck: bool):
+def _drive(*, log_output: str, csv_text: str):
     """Run run_connection_requests to the advance gate. Returns
     (advance_spy, silent_spy)."""
     from clients.pb_envelope import PBCompletion, PBLaunch, hash_arguments
     from workflows.daily_check import run_connection_requests
 
     invite_url = "https://www.linkedin.com/in/invite-target/"
-    recheck_url = "https://www.linkedin.com/in/recheck-target/"
 
     pb = MagicMock()
     launch = PBLaunch(
@@ -63,18 +64,13 @@ def _drive(*, log_output: str, csv_text: str, include_recheck: bool):
     pb.download_result_csv.return_value = csv_text
 
     entries = [_entry(entry_id="ent-inv", record_id="rec-inv", stage_title="Prospect")]
-    if include_recheck:
-        entries.append(
-            _entry(entry_id="ent-rc", record_id="rec-rc", stage_title="Connection Sent")
-        )
 
     attio = MagicMock()
     attio.is_person_company_corrupted.return_value = False
     attio.query_list_entries.return_value = entries
+    stub_guard_reread(attio, entries)
 
     def _cache_get(record_id):
-        if record_id == "rec-rc":
-            return ("RC Person", "Acme", recheck_url, "", "Plant Manager")
         return ("Inv Person", "Acme", invite_url, "", "Plant Manager")
 
     # Degree check passthrough: the invite row is the confirmed 2nd/3rd-degree
@@ -97,20 +93,14 @@ def _drive(*, log_output: str, csv_text: str, include_recheck: bool):
          patch("workflows.daily_check.RecordCache.get", side_effect=_cache_get), \
          patch("workflows.daily_check.can_send_connections", return_value=True), \
          patch("workflows.daily_check.record_connections"), \
-         patch("workflows.daily_check.record_visits"), \
-         patch("workflows.daily_check.get_remaining",
-               return_value={"connections": 25, "messages": 30, "visits": 50}), \
+         patch("workflows.daily_check.get_remaining", return_value={"connections": 25, "messages": 30, "visits": 50}), \
          patch("workflows.daily_check.get_current_experiment_id", return_value="exp-1"), \
          patch("workflows.daily_check._pre_invite_degree_check", side_effect=_passthrough_pic), \
          patch("workflows.daily_check.write_prospects_to_sheet",
                return_value="https://docs.google.com/spreadsheets/d/fake"), \
          patch("workflows.daily_check._advance_already_processed_rows", advance_spy), \
          patch("workflows.daily_check._attio_advance_with_escalation", perrow_spy), \
-         patch("workflows.daily_check.emit_pb_silent_no_op", silent_spy), \
-         patch("workflows.daily_check.recheck_cache") as mock_rc:
-        # recheck partition: mark the recheck URL stale so it joins the batch.
-        mock_rc.partition.side_effect = lambda urls: ({}, list(urls))
-        mock_rc.RECHECK_TTL_DAYS = 3
+         patch("workflows.daily_check.emit_pb_silent_no_op", silent_spy):
         run_connection_requests(
             attio=attio, pb=pb, network_booster_id="agent-nb", auto_confirm=True,
             daily_run=fake_daily_run(),
@@ -125,10 +115,11 @@ _MARKER = (
 )
 
 
-def test_invites_only_already_processed_advances_no_silent_no_op():
-    advance_spy, silent_spy, _ = _drive(log_output=_MARKER, csv_text="", include_recheck=False)
-    assert advance_spy.called, "invites-only already-processed batch must advance"
-    assert not silent_spy.called, "must NOT open pb_silent_no_op on a clean advance"
+def test_already_processed_batch_does_not_claim_unconfirmed_invites():
+    advance_spy, silent_spy, perrow_spy = _drive(log_output=_MARKER, csv_text="")
+    assert not advance_spy.called
+    assert not perrow_spy.called
+    assert silent_spy.called
 
 
 def test_auth_failure_does_not_advance_opens_silent_no_op():
@@ -138,35 +129,21 @@ def test_auth_failure_does_not_advance_opens_silent_no_op():
     csv_text = "query,error\nhttps://www.linkedin.com/in/invite-target/,\n"
     advance_spy, silent_spy, perrow_spy = _drive(
         log_output="🔄 Connecting to LinkedIn...\n❌ No valid credentials found",
-        csv_text=csv_text, include_recheck=False,
+        csv_text=csv_text,
     )
     assert not advance_spy.called
     assert not perrow_spy.called, "auth failure must NOT advance any invite row"
     assert silent_spy.called, "auth failure must open pb_silent_no_op"
 
 
-def test_clean_authenticated_launch_advances_optimistically():
-    # The Network Booster CSV reports zero 'Message sent' (no such column), but
-    # the launch is clean + authenticated -> optimistically advance every
-    # requested invite (per-row path), and do NOT open pb_silent_no_op.
+def test_explicit_send_log_advances_confirmed_invite():
     csv_text = (
         "query,status\n"
         "https://www.linkedin.com/in/invite-target/,Can't send message\n"
     )
     advance_spy, silent_spy, perrow_spy = _drive(
-        log_output="🔄 Adding Invite Target...\n✅ CSV saved\nProcess finished successfully",
-        csv_text=csv_text, include_recheck=False,
+        log_output="🔄 Adding Invite Target...\nInvitation sent to invite-target\n✅ CSV saved\nProcess finished successfully",
+        csv_text=csv_text,
     )
-    assert perrow_spy.called, "clean authenticated invite batch must advance optimistically"
-    assert not silent_spy.called, "no pb_silent_no_op when the gate passes optimistically"
-
-
-def test_mixed_batch_with_recheck_does_not_advance():
-    # Marker present BUT the batch carries a re-check row, so the batch-level
-    # marker is ambiguous -> conservative: do NOT advance, open pb_silent_no_op.
-    advance_spy, silent_spy, _ = _drive(log_output=_MARKER, csv_text="", include_recheck=True)
-    assert not advance_spy.called, (
-        "mixed batch (invites + re-checks) must NOT advance — the batch-level "
-        "already-processed marker could be tripped by the re-check rows"
-    )
-    assert silent_spy.called
+    assert perrow_spy.called
+    assert not silent_spy.called

@@ -1,22 +1,18 @@
-"""PB phantoms count the Google-Sheet header row as a processable CSV line,
-so every launch fed by write_prospects_to_sheet must pass
-numberOfProfilesPerLaunch = batch + SHEET_HEADER_LINES — a raw len(batch)
-silently drops the LAST row of every batch.
+"""PB phantoms count Google-Sheet headers as processable CSV lines.
+
+Send sheets retain their header and launch at batch + SHEET_HEADER_LINES.
+Profile-scraper sheets omit the header and launch at the raw URL count.
 
 Verified live 2026-06-12, twice:
 1. Phase 0, 1 stale profile: PB log "Got 2 lines from csv → Processing 1
    profile" then "profileUrl is not a correct LinkedIn Profile URL" — the
    phantom processed the literal header and the run went BLIND (container
-   1117150263943401). Recurs every run while the stale set is small.
+   1117150263943401). This was the behavior before headerless scraper sheets.
 2. Surgical Phase 0 pass, 4 profiles: 3 scraped + flipped; the 4th got no
    result row and no recheck-cache stamp — the header ate one slot.
 
-The +1 is safe on the other side: the phantom treats the argument as a
-tight cap and never processes more lines than the input contains, so
-over-asking by the header line can't over-process (same semantics the
-2026-06-10 cap-trickle fixes rely on). The only hard ceiling is the
-phantom's argument schema max (150 for the SN Profile Scraper) — the
-per-site cap tests assert cap + SHEET_HEADER_LINES stays under it.
+The send phantoms still receive a header, so their launch count includes
+SHEET_HEADER_LINES. The scraper launch count now equals its URL row count.
 
 Per-site launch-arg values are asserted in the existing site tests
 (test_phase0_*, test_dm_launch_cap_drain, test_invite_launch_cap,
@@ -26,8 +22,6 @@ This module locks the shared contract itself.
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from clients.google_sheets import (
@@ -35,8 +29,6 @@ from clients.google_sheets import (
     profiles_per_launch,
     write_prospects_to_sheet,
 )
-
-_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Verified 2026-06-12 via PB scripts/fetch (read-only) against the live
 # workspace: SN Auto Connect (Network Booster, script id 29582) and SN
@@ -94,23 +86,19 @@ def test_sheet_writer_prepends_exactly_one_header_row():
     ws.clear.assert_called_once()
 
 
-def test_no_launch_site_passes_raw_batch_len():
-    """Static sweep: a new (or regressed) launch site that passes
-    numberOfProfilesPerLaunch as a raw len(...) re-introduces the
-    last-row drop. Sheet-fed sites must go through profiles_per_launch;
-    bare-URL launches (no sheet, no header — e.g. the single-URL SN
-    pre-invite branch) bind the count to a named variable instead, so
-    they don't match this pattern either."""
-    raw_len_arg = re.compile(r'"numberOfProfilesPerLaunch"\s*:\s*len\(')
-    offenders = []
-    for sub in ("workflows", "clients", "scripts"):
-        for path in sorted((_REPO_ROOT / sub).glob("*.py")):
-            for lineno, line in enumerate(path.read_text().splitlines(), 1):
-                if raw_len_arg.search(line):
-                    offenders.append(f"{path.relative_to(_REPO_ROOT)}:{lineno}")
-    assert not offenders, (
-        "numberOfProfilesPerLaunch passed as raw len(batch) — the sheet "
-        "header eats one slot and the last row of every batch is silently "
-        "dropped. Use clients.google_sheets.profiles_per_launch for "
-        f"sheet-fed launches: {offenders}"
-    )
+def test_profile_scraper_sheet_contains_only_url_rows():
+    ws = MagicMock()
+    sh = MagicMock()
+    sh.worksheet.return_value = ws
+    gc = MagicMock()
+    gc.open_by_key.return_value = sh
+
+    rows = [{"profileUrl": f"https://www.linkedin.com/in/p{i}/"} for i in range(3)]
+    with patch("clients.google_sheets.get_client", return_value=gc):
+        write_prospects_to_sheet(
+            rows, spreadsheet_id="sid", columns=["profileUrl"],
+            include_header=False,
+        )
+
+    assert ws.update.call_args.args[0] == [[row["profileUrl"]] for row in rows]
+    ws.clear.assert_called_once()

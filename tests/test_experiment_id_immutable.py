@@ -18,6 +18,8 @@ import os
 from datetime import UTC, date, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tests.fakes import fake_daily_run
 
 
@@ -80,7 +82,7 @@ def _drive_invite_success(
     completion = PBCompletion(
         container_id="c-inv",
         status="finished",
-        log_output="",
+        log_output="Invitation sent to test-invite-immutable",
         raw_output={"status": "finished", "output": ""},
     )
     pb.launch_agent.return_value = launch
@@ -324,7 +326,7 @@ def test_regular_invite_path_escalate_raise_does_not_orphan_other_rows():
     completion = PBCompletion(
         container_id="c-multi",
         status="finished",
-        log_output="",
+        log_output="Invitation sent to orphan-test-1\nInvitation sent to orphan-test-2",
         raw_output={"status": "finished", "output": ""},
     )
     pb.launch_agent.return_value = launch
@@ -421,3 +423,12 @@ def test_regular_invite_path_escalate_raise_does_not_orphan_other_rows():
         "row) was orphaned — the for-loop terminated mid-batch. This "
         "is the exact §3.1 hard red-line FIX-2' was sold as fixing."
     )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_state_boundary():
+    from unittest.mock import patch
+
+    from workflows.email_send_guard import GuardResult
+    with patch("workflows.daily_check.verify_send_preconditions", return_value=GuardResult(True)), patch("workflows.email_campaign.verify_email_send_preconditions", return_value=GuardResult(True)), patch("workflows.dm_quality_gate.require_clear_dm_quality_queue"):
+        yield

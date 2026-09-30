@@ -149,3 +149,13 @@ def get_email_template(step: EmailStep, language: str = "en") -> dict:
 def personalize_email(template: str, first_name: str, company: str) -> str:
     """Replace {{first_name}} and {{company}} placeholders."""
     return template.replace("{{first_name}}", first_name).replace("{{company}}", company)
+
+
+def get_email_from() -> str:
+    """Read the configured public operator sender identity."""
+    return os.environ.get("EMAIL_FROM", EMAIL_FROM)
+
+
+def get_reply_to() -> str:
+    """Read the configured public operator reply address."""
+    return os.environ.get("EMAIL_REPLY_TO", EMAIL_REPLY_TO)

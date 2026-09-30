@@ -81,7 +81,7 @@ class CRMBundle:
             self.attio.close()
 
 
-def _build_attio(api_key: str | None = None) -> CRMBundle:
+def _build_attio(api_key: str | None = None, *, client_factory=None) -> CRMBundle:
     """Build an Attio-backed bundle.
 
     Constructs the inner ``AttioClient`` here (so the factory, not the provider,
@@ -103,7 +103,7 @@ def _build_attio(api_key: str | None = None) -> CRMBundle:
     # the operator's renamed slugs — the same mapping the provider uses for
     # stage translation, loaded once. Under the identity default this is the
     # canonical Attio map, so construction stays byte-identical.
-    cls = clients.attio.AttioClient
+    cls = client_factory or clients.attio.AttioClient
     attio = (
         cls(api_key=api_key, field_mapping=mapping.field_mapping)
         if api_key is not None
@@ -112,7 +112,7 @@ def _build_attio(api_key: str | None = None) -> CRMBundle:
     return CRMBundle(provider=AttioProvider(attio, mapping=mapping), attio=attio)
 
 
-def get_crm_provider() -> CRMBundle:
+def get_crm_provider(*, client_factory=None) -> CRMBundle:
     """Construct the engine's CRM provider from ``config/crm.yaml`` (or env).
 
     Resolution order:
@@ -136,7 +136,7 @@ def get_crm_provider() -> CRMBundle:
     config_path = config_dir() / "crm.yaml"
     if not config_path.exists():
         # No config file → backward-compatible Attio-from-env default.
-        return _build_attio()
+        return _build_attio(client_factory=client_factory)
 
     config = load_yaml("crm")
     vendor = config.get("vendor", _DEFAULT_VENDOR)
@@ -152,7 +152,7 @@ def get_crm_provider() -> CRMBundle:
                 f"got {type(credentials).__name__}."
             )
         api_key = resolve_env_ref(credentials, "api_key_env", required=False)
-        return _build_attio(api_key=api_key)
+        return _build_attio(api_key=api_key, client_factory=client_factory)
 
     raise ConfigError(
         f"Unknown CRM vendor {vendor!r} in config/crm.yaml. "

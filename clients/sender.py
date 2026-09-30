@@ -24,7 +24,7 @@ routing decision instead of a rewrite:
 The PB code in `workflows/daily_check.py` needs more than the protocol's
 `SendOutcome`: the advance gate keys on the `PBLaunch` container id,
 `emit_pb_silent_no_op` / audit events carry it, and the invite
-optimistic-advance diagnostic parses the completion log. So `PBSender`
+per-person confirmation parser reads the completion log. So `PBSender`
 also exposes PB-shaped per-launch methods (`launch_invite_batch` /
 `launch_dm_batch`) returning the full `PBSendResult` envelope; the
 protocol methods are thin wrappers over them.
@@ -45,6 +45,7 @@ from clients.botdog import (
 )
 from clients.google_sheets import write_prospects_to_sheet
 from clients.pb_envelope import (
+    NETWORK_BOOSTER_BUILTIN_PER_LAUNCH_CAP,
     PBCompletion,
     PBLaunch,
     SendOutcome,
@@ -197,7 +198,7 @@ class PBSendResult:
     `SendOutcome` because the PB code in `daily_check` still needs them:
     the advance gate checks the launch container id, the pb_silent_no_op
     / inmail_dead_end queue rows embed the launch, and the invite
-    optimistic-advance diagnostic parses the completion log. A queueing
+    per-person confirmation parser reads the completion log. A queueing
     transport has no equivalent — this envelope is PB-internal.
     """
 
@@ -241,19 +242,27 @@ class PBSender:
     def launch_invite_batch(
         self, rows: list[dict], requested_urls: set[str]
     ) -> PBSendResult:
-        """One Network Booster launch for an approved invite batch.
-
-        ``rows`` is everything written to the sheet (invites AND the
-        CONNECTION_SENT re-check rows that share the launch);
-        ``requested_urls`` is only the normalized invite URLs, because
-        the outcome parse and the invite override reason about sends,
-        not visits.
-        """
+        """One Network Booster launch for an approved invite batch."""
         if not self._network_booster_id:
             raise ValueError("PBSender: network_booster_id not configured")
+        # Network Booster script 2818 exposes numberOfAddsPerLaunch (max 10).
+        # numberOfProfilesPerLaunch belongs to the scraper/message phantoms
+        # and was ignored here, silently truncating larger invite batches.
+        if not 1 <= len(rows) <= NETWORK_BOOSTER_BUILTIN_PER_LAUNCH_CAP:
+            raise ValueError(
+                "Network Booster invite batches must contain 1-"
+                f"{NETWORK_BOOSTER_BUILTIN_PER_LAUNCH_CAP} rows; got {len(rows)}"
+            )
         sheet_url = self._write_sheet(rows)
         click.echo(f"  Wrote {len(rows)} rows to Google Sheet.")
-        launch_args = {"spreadsheetUrl": sheet_url, **self._session_args()}
+        launch_args = {
+            "spreadsheetUrl": sheet_url,
+            # This limit counts additions, not CSV lines; the header is not
+            # an addition. A larger daily allowance requires multiple
+            # container-keyed launches, not a larger value here.
+            "numberOfAddsPerLaunch": len(rows),
+            **self._session_args(),
+        }
         launch = self._pb.launch_agent(self._network_booster_id, launch_args)
         # Block until the phantom finishes — prevents workspace
         # parallel-execution cap when the next phantom (Message Sender)
@@ -268,15 +277,14 @@ class PBSender:
             csv_text=csv_text,
             requested_urls=requested_urls,
         )
-        # Network Booster (invite) override: its result.csv is unreliable
-        # for per-run send confirmation (no `status` column, accumulates
-        # stale rows), so the parsed outcome is always Skipped/0 and the
-        # gate never advanced invites — they re-queued forever and Phase 0
-        # never watched for accepts. A clean, authenticated, uncapped
-        # launch advances ALL requested invites; a dead-cookie or capped
-        # launch stays Skipped → pb_silent_no_op. (DM sequencing keeps the
-        # strict CSV gate — its `status` column is reliable.)
-        outcome = compute_invite_outcome(outcome, completion, requested_urls)
+        # Invite CSVs accumulate stale rows. Advance only requested people
+        # whose invitation is confirmed in this container's completion log.
+        outcome = compute_invite_outcome(
+            outcome,
+            completion,
+            requested_urls,
+            launch_batch_size=len(rows),
+        )
         return PBSendResult(launch=launch, completion=completion, outcome=outcome)
 
     def launch_dm_batch(
@@ -292,6 +300,7 @@ class PBSender:
         launch_args = {
             "spreadsheetUrl": sheet_url,
             "message": "#message#",  # per-row from sheet column
+            "numberOfProfilesPerLaunch": len(rows) + 1,
             **self._session_args(),
         }
         # Typed launch + raises-on-error wait. PBRunFailed bubbles up so the

@@ -18,6 +18,8 @@ subdomain — are the real thing.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from scripts.gmail_sweep import (
@@ -322,6 +324,7 @@ def test_group_with_only_auto_responses_still_surfaces_as_owed():
     }
     row = _rows_by_key(threads)["acmebeverage.com"]
     assert row["ball_mine"] is True
+    assert row["ball_mine"] is True
     assert row["latest_ms"] == 100
 
 
@@ -413,7 +416,7 @@ def test_list_all_reports_complete_when_pagination_exhausts():
         {"messages": [{"threadId": "a"}], "nextPageToken": "t1"},
         {"messages": [{"threadId": "b"}]},
     ]))
-    msgs, pages, complete = list_all(svc, "q")
+    msgs, pages, complete = list_all(svc, "q", pacer=_RecordingPacer())
     assert [m["threadId"] for m in msgs] == ["a", "b"]
     assert (pages, complete) == (2, True)
 
@@ -428,7 +431,7 @@ def test_list_all_returns_partial_instead_of_dying_on_api_error():
         {"messages": [{"threadId": "a"}], "nextPageToken": "t1"},
         RuntimeError("429 rate limited"),
     ]))
-    msgs, pages, complete = list_all(svc, "q")
+    msgs, pages, complete = list_all(svc, "q", pacer=_RecordingPacer())
     assert [m["threadId"] for m in msgs] == ["a"]
     assert (pages, complete) == (1, False)
 
@@ -438,7 +441,7 @@ def test_list_all_breaks_out_of_a_repeated_page_token():
     svc = _FakeSvc(messages=_FakeList([
         {"messages": [{"threadId": "a"}], "nextPageToken": "same"},
     ]))
-    msgs, pages, complete = list_all(svc, "q")
+    msgs, pages, complete = list_all(svc, "q", pacer=_RecordingPacer())
     assert complete is False
     assert pages < MAX_PAGES
 
@@ -452,7 +455,7 @@ def test_list_all_flags_the_page_cap_instead_of_truncating_silently():
                               "nextPageToken": f"t{self.calls}"})
 
     svc = _FakeSvc(messages=_Endless([{}]))
-    msgs, pages, complete = list_all(svc, "q")
+    msgs, pages, complete = list_all(svc, "q", pacer=_RecordingPacer())
     assert (len(msgs), pages, complete) == (MAX_PAGES, MAX_PAGES, False)
 
 
@@ -466,3 +469,162 @@ def test_fetch_threads_names_the_threads_it_lost():
     threads, failed = fetch_threads(_FakeSvc(threads=_Threads()), ["ok", "bad"])
     assert set(threads) == {"ok"}
     assert failed == ["bad"]
+
+
+def test_fetch_threads_with_isolated_workers_preserves_failures():
+    class _Threads:
+        def get(self, **kwargs):
+            if kwargs["id"] == "bad":
+                return _FakeExec(RuntimeError("500"))
+            return _FakeExec({"messages": [{"id": kwargs["id"]}]})
+
+    services = [_FakeSvc(threads=_Threads()) for _ in range(3)]
+    threads, failed = fetch_threads(
+        services[0], ["one", "two", "bad", "three", "four"],
+        worker_services=services[1:],
+    )
+    assert set(threads) == {"one", "two", "three", "four"}
+    assert failed == ["bad"]
+
+
+def test_worker_setup_failure_falls_back_to_complete_serial_sweep(monkeypatch, capsys):
+    from scripts import gmail_sweep
+
+    service = _FakeSvc(threads=type("Threads", (), {
+        "get": lambda self, **kwargs: _FakeExec({"messages": [{"id": kwargs["id"]}]})
+    })())
+    calls = 0
+
+    def credentials():
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise RuntimeError("worker setup")
+        return type("Client", (), {"_service": service})()
+
+    monkeypatch.setattr(gmail_sweep.GmailClient, "from_credentials", credentials)
+    monkeypatch.setattr(gmail_sweep, "list_all", lambda svc, q, **kwargs: (
+        ([{"threadId": "one"}], 1, True) if "in:sent " in q else ([], 1, True)
+    ))
+    gmail_sweep.main()
+    result = json.loads(capsys.readouterr().out)
+    assert result["unique_threads"] == 1
+    assert result["fetch_errors"] == 0
+    assert result["sweep_complete"] is True
+
+
+class _RecordingPacer:
+    def __init__(self):
+        self.admissions = 0
+        self.delays = []
+
+    def wait(self):
+        self.admissions += 1
+
+    def cooldown(self, seconds):
+        self.delays.append(seconds)
+
+
+def _http_error(status, reason="rateLimitExceeded", retry_after=None):
+    from googleapiclient.errors import HttpError
+    from httplib2 import Response
+    headers = {"status": str(status)}
+    if retry_after is not None:
+        headers["retry-after"] = retry_after
+    return HttpError(Response(headers), json.dumps({
+        "error": {"errors": [{"reason": reason}]}
+    }).encode())
+
+
+@pytest.mark.parametrize("status,reason", [
+    (403, "rateLimitExceeded"), (403, "userRateLimitExceeded"),
+    (429, "anything"), (503, "backendError"),
+])
+def test_transient_page_failure_retries_same_page_without_losing_coverage(status, reason):
+    svc = _FakeSvc(messages=_FakeList([
+        _http_error(status, reason),
+        {"messages": [{"threadId": "a"}]},
+    ]))
+    # Request execution, not request construction, is retried.
+    calls = []
+    class Request:
+        def execute(self):
+            calls.append(1)
+            if len(calls) == 1:
+                raise _http_error(status, reason)
+            return {"messages": [{"threadId": "a"}]}
+    svc.users().messages().list = lambda **kwargs: Request()
+    pacer = _RecordingPacer()
+    rows, pages, complete = list_all(svc, "q", pacer=pacer)
+    assert rows == [{"threadId": "a"}]
+    assert (pages, complete, pacer.admissions) == (1, True, 2)
+    assert len(pacer.delays) == 1
+
+
+def test_exhausted_thread_remains_unread_and_other_threads_survive():
+    class Threads:
+        def get(self, **kwargs):
+            return _FakeExec(_http_error(403) if kwargs["id"] == "bad" else {"id": kwargs["id"]})
+    pacer = _RecordingPacer()
+    svc = _FakeSvc(threads=Threads())
+    threads, failed = fetch_threads(svc, ["ok", "bad"], worker_services=[svc], pacer=pacer)
+    assert threads == {"ok": {"id": "ok"}}
+    assert failed == ["bad"]
+    assert pacer.admissions == 9
+    assert len(pacer.delays) == 7
+    assert all(2 ** i <= delay <= 2 ** i + 1 for i, delay in enumerate(pacer.delays))
+
+
+@pytest.mark.parametrize("status,reason", [(403, "insufficientPermissions"), (401, "authError"), (404, "notFound")])
+def test_permanent_errors_are_not_retried(status, reason):
+    from scripts.gmail_sweep import execute_read
+    pacer = _RecordingPacer()
+    error = _http_error(status, reason)
+    with pytest.raises(type(error)):
+        execute_read(_FakeExec(error), pacer)
+    assert pacer.admissions == 1
+    assert pacer.delays == []
+
+
+@pytest.mark.parametrize("retry_after", ["30", "Thu, 01 Jan 1970 00:00:30 GMT"])
+def test_retry_after_is_a_shared_cooldown(monkeypatch, retry_after):
+    from scripts import gmail_sweep
+    monkeypatch.setattr(gmail_sweep.time, "time", lambda: 0)
+    pacer = _RecordingPacer()
+    class Request:
+        def execute(self):
+            if pacer.admissions == 1:
+                raise _http_error(429, retry_after=retry_after)
+            return "ok"
+    assert gmail_sweep.execute_read(Request(), pacer) == "ok"
+    assert pacer.delays == [30]
+
+
+@pytest.mark.parametrize("retry_after", ["3600", "invalid"])
+def test_unusable_retry_after_fails_closed(retry_after):
+    from scripts.gmail_sweep import execute_read
+    pacer = _RecordingPacer()
+    error = _http_error(429, retry_after=retry_after)
+    with pytest.raises(type(error)):
+        execute_read(_FakeExec(error), pacer)
+    assert pacer.admissions == 1
+
+
+def test_pacer_spaces_reads_and_extends_cooldown(monkeypatch):
+    from types import SimpleNamespace
+
+    from scripts import gmail_sweep
+    now = [0.0]
+    def sleep(delay):
+        now[0] += delay
+    monkeypatch.setattr(gmail_sweep, "time", SimpleNamespace(monotonic=lambda: now[0], sleep=sleep))
+    pacer = gmail_sweep.ReadPacer()
+    pacer.wait()
+    pacer.wait()
+    assert now[0] == 0.5
+    pacer.cooldown(30)
+    pacer.cooldown(1)  # Another worker must not shorten the shared pause.
+    pacer.wait()
+    assert now[0] == 30.5
+    pacer.wait()
+    assert now[0] == 31

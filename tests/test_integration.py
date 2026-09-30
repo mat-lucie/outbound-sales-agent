@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from clients.crm.attio_provider import AttioProvider
 from clients.pb_envelope import PBCompletion, PBLaunch, hash_arguments
-from tests.fakes import fake_daily_run
+from tests.fakes import fake_daily_run, stub_guard_reread
 from workflows.daily_run import DailyRun
 from workflows.schema_preflight import DM_COMPANY_WRITER_ATTRS, DM_ENTRY_WRITER_ATTRS
 
@@ -24,10 +24,18 @@ def _attio_with_full_schema(**extra_methods) -> MagicMock:
     # mock for every record, so every prospect looks like it shares one company
     # and the within-run same-company dedup silently drops rows. Start empty.
     attio._person_to_company = {}
+    # Real str→str cache like AttioClient. A bare MagicMock attribute would
+    # answer `.get(record_id)` with the SAME child mock for every record, so
+    # every prospect in a batch looks like it shares one company and the
+    # within-run `seen_company_ids` dedup silently drops all but the first
+    # row before it is ever sent. Tests that want a company link set it
+    # explicitly (`attio._person_to_company = {rec: company}`).
+    attio._person_to_company = {}
     attio.is_person_company_corrupted.return_value = False
     attio.get_list_attributes.return_value = [{"api_slug": s} for s in DM_ENTRY_WRITER_ATTRS]
     attio.get_object_attributes.return_value = [{"api_slug": s} for s in DM_COMPANY_WRITER_ATTRS]
     attio.search_companies.return_value = []
+    attio._request.return_value = {"data": []}  # explicit clean P0 queue
     for attr, val in extra_methods.items():
         setattr(attio, attr, val)
     return attio
@@ -460,24 +468,22 @@ class TestDailyConnectionsIntegration:
             quality_score=75,
         )
 
-        attio = MagicMock()
-        attio.is_person_company_corrupted.return_value = False
+        attio = _attio_with_full_schema()
         # F-PR-5: Network Booster now consumes SendOutcome + advance gate.
         # The CSV must mark this prospect's URL as "Message sent" for the
         # gate to pass and Attio update_list_entry to fire.
         pb = _typed_pb_mock(
-            csv_text="query,status\nhttps://linkedin.com/in/carlosejemplo,Message sent\n",
+            csv_text="query,status\nhttps://linkedin.com/in/carlosmendoza,Message sent\n",
+            log="Invitation sent to carlosmendoza",
         )
         attio.query_list_entries.return_value = [entry]
+        stub_guard_reread(attio, [entry])
 
         with patch("workflows.daily_check.RecordCache.get") as mock_cache_get, \
              patch("workflows.daily_check.can_send_connections", return_value=True), \
              patch("workflows.daily_check.record_connections"), \
-             patch("workflows.daily_check.record_visits"), \
-             patch("workflows.daily_check.get_remaining",
-                   return_value={"connections": 25, "messages": 30, "visits": 50}), \
              patch("workflows.daily_check.write_prospects_to_sheet", return_value="https://docs.google.com/spreadsheets/d/fake"):
-            mock_cache_get.return_value = ("Carlos Ejemplo", "CEMENTRA", "https://linkedin.com/in/carlosejemplo", "", "")
+            mock_cache_get.return_value = ("Carlos Mendoza", "CEMEX", "https://linkedin.com/in/carlosmendoza", "", "")
             result = run_connection_requests(
                 attio=attio,
                 pb=pb,
@@ -490,12 +496,49 @@ class TestDailyConnectionsIntegration:
         pb.launch_agent.assert_called_once()
 
         # Attio entry should be updated to Connection Sent
-        attio.update_list_entry.assert_called_once()
-        update_call = attio.update_list_entry.call_args
+        stage_calls = [c for c in attio.update_list_entry.call_args_list
+                       if "stage" in c.kwargs.get("entry_attributes", {})]
+        assert len(stage_calls) == 1
+        update_call = stage_calls[0]
         attrs = update_call[1].get("entry_attributes", update_call[0][1] if len(update_call[0]) > 1 else {})
         assert attrs["stage"] == "Connection Sent"
 
         assert result["sent"] == 1
+
+    @patch.dict(os.environ, {
+        "ATTIO_LIST_ID": "list-001", "ATTIO_API_KEY": "fake",
+        "PHANTOMBUSTER_API_KEY": "fake",
+        "STRICT_PRE_INVITE_DEGREE_CHECK": "false",
+    })
+    def test_already_pending_advances_stage_without_charging_today(self):
+        from workflows.daily_check import run_connection_requests
+
+        entry = _make_attio_entry(
+            entry_id="entry-pending", record_id="rec-pending",
+            stage="Prospect", quality_score=75,
+        )
+        attio = _attio_with_full_schema()
+        attio.query_list_entries.return_value = [entry]
+        stub_guard_reread(attio, [entry])
+        pb = _typed_pb_mock(
+            csv_text="query,error\n",
+            log=("Invitation for https://www.linkedin.com/in/pending-person "
+                 "already sent, still pending."),
+        )
+        dr = fake_daily_run()
+        with patch("workflows.daily_check.RecordCache.get", return_value=(
+            "Pending Person", "Co", "https://linkedin.com/in/pending-person", "", "",
+        )), patch("workflows.daily_check.can_send_connections", return_value=True), \
+             patch("workflows.daily_check.write_prospects_to_sheet", return_value="https://sheet/x"), \
+             patch("workflows.daily_check.record_connections") as record:
+            result = run_connection_requests(
+                attio=attio, pb=pb, network_booster_id="agent-nb",
+                auto_confirm=True, daily_run=dr,
+            )
+        dr.confirm_lease.assert_called_once_with("fake-lease-token", confirmed_count=0)
+        record.assert_called_once_with(0)
+        assert result["sent"] == 0
+        assert result["attio_updated"] == 1
 
     @patch.dict(os.environ, {"ATTIO_LIST_ID": "list-001", "ATTIO_API_KEY": "fake", "PHANTOMBUSTER_API_KEY": "fake"})
     def test_respects_daily_limits(self):
@@ -509,8 +552,7 @@ class TestDailyConnectionsIntegration:
             quality_score=80,
         )
 
-        attio = MagicMock()
-        attio.is_person_company_corrupted.return_value = False
+        attio = _attio_with_full_schema()
         pb = MagicMock()
         attio.query_list_entries.return_value = [entry]
 
@@ -550,17 +592,14 @@ class TestDailyConnectionsIntegration:
             stage="Prospect",
             quality_score=75,
         )
-        attio = MagicMock()
-        attio.is_person_company_corrupted.return_value = False
+        attio = _attio_with_full_schema()
         pb = _typed_pb_mock(csv_text=None, log="❌ No valid credentials found")  # auth fail → invites NOT sent → gate fails
         attio.query_list_entries.return_value = [entry]
+        stub_guard_reread(attio, [entry])
 
         with patch("workflows.daily_check.RecordCache.get") as mock_cache_get, \
              patch("workflows.daily_check.can_send_connections", return_value=True), \
              patch("workflows.daily_check.record_connections") as mock_record, \
-             patch("workflows.daily_check.record_visits"), \
-             patch("workflows.daily_check.get_remaining",
-                   return_value={"connections": 25, "messages": 30, "visits": 50}), \
              patch("workflows.daily_check.write_prospects_to_sheet", return_value="https://docs.google.com/spreadsheets/d/fake"), \
              patch("workflows.daily_check.emit_pb_silent_no_op") as mock_emit:
             mock_cache_get.return_value = ("Dry Skip", "Co", "https://linkedin.com/in/dryskip", "", "")
@@ -572,8 +611,11 @@ class TestDailyConnectionsIntegration:
                 daily_run=fake_daily_run(),
             )
 
-        # No Attio writes when the gate fails.
-        attio.update_list_entry.assert_not_called()
+        # The prelaunch hold remains, but no stage advance occurs.
+        assert len(attio.update_list_entry.call_args_list) == 1
+        assert attio.update_list_entry.call_args.kwargs["entry_attributes"] == {
+            "invite_eligible_after": "2099-12-31"
+        }
         # Dry-skip emission happens exactly once.
         mock_emit.assert_called_once()
         # Daily cap charged ZERO — gate-failed batches must not burn
@@ -585,17 +627,27 @@ class TestDailyConnectionsIntegration:
         "GSHEET_AUTOCONNECT_ID": "fake-sheet-id",
         "PB_LI_SESSION_COOKIE": "fake-cookie", "PB_LI_USER_AGENT": "TestAgent/1.0", "STRICT_PRE_INVITE_DEGREE_CHECK": "false",
     })
-    def test_connection_requests_optimistic_advance_on_clean_launch(self):
-        """Post-#164: the Network Booster CSV is unreliable for per-run send
-        confirmation (no `status` column, stale accumulated rows), so a clean
-        AUTHENTICATED launch advances ALL requested invites OPTIMISTICALLY —
-        the per-URL CSV gate that this test originally pinned no longer governs
-        the invite path (the upstream override sets sent_urls = all requested).
+    def test_connection_requests_clean_launch_advances_every_requested_row(self, capsys):
+        """Phase B (2026-06-15, authoritative advance): on a clean,
+        authenticated, uncapped Network Booster launch EVERY requested
+        invite row advances to Connection Sent — including rows the
+        per-launch CSV/log did not echo back — stamped with the
+        `INVITE_OPTIMISTIC_ADVANCE` audit marker. The CSV/log list is a
+        forensic diagnostic, not a per-row gate (see
+        `clients.pb_envelope.compute_invite_outcome`).
 
-        Setup: 2 Prospects in the batch, a clean launch whose CSV confirms only
-        one of them (which the override ignores). Expect: BOTH rows advance to
-        CONNECTION_SENT — 2 Attio updates — and no pb_silent_no_op.
+        Supersedes the pre-Phase-B "ghost advance prevention" test, which
+        asserted the opposite (CSV-unconfirmed row stays at Prospect). That
+        test only kept passing because the fixture's `_person_to_company`
+        was a bare MagicMock, so both rows resolved to the SAME company
+        mock and the within-run same-company dedup dropped the second row
+        before it was ever sent. With an honest cache the two rows are
+        distinct companies and both go out.
+
+        Setup: 2 Prospects at 2 different companies. PB CSV marks only ONE
+        as sent. Expect: 2 Attio updates, both to Connection Sent.
         """
+        from clients.pb_envelope import INVITE_OPTIMISTIC_ADVANCE
         from workflows.daily_check import run_connection_requests
 
         sent_entry = _make_attio_entry(
@@ -604,45 +656,42 @@ class TestDailyConnectionsIntegration:
             stage="Prospect",
             quality_score=75,
         )
-        ghost_entry = _make_attio_entry(
-            entry_id="entry-ghost-001",
-            record_id="rec-ghost-001",
+        unechoed_entry = _make_attio_entry(
+            entry_id="entry-unechoed-001",
+            record_id="rec-unechoed-001",
             stage="Prospect",
             quality_score=75,
         )
 
-        attio = MagicMock()
-        attio.is_person_company_corrupted.return_value = False
-        # Distinct companies so the within-run per-company dedup (#156) keeps
-        # both rows — this test exercises optimistic advance, not dedup.
-        attio._person_to_company = {"rec-sent-001": "co-a", "rec-ghost-001": "co-b"}
-        attio.get_company.return_value = {"values": {}}  # no last_outreach_at → permitted
-        # CSV only confirms sent-001; the optimistic override advances both.
+        attio = _attio_with_full_schema()
+        attio._person_to_company = {
+            "rec-sent-001": "company-sent",
+            "rec-unechoed-001": "company-unechoed",
+        }
+        # Network Booster explicitly confirms both URLs in its launch log.
         pb = _typed_pb_mock(
             csv_text=_make_sn_csv([{
                 "query": "https://linkedin.com/in/sent-one",
                 "linkedinProfileUrl": "https://linkedin.com/in/sent-one",
                 "status": "Message sent",
             }]),
-            log="🔄 Adding profiles...\n✅ CSV saved\nProcess finished successfully",
+            log="Invitation sent to sent-one\nInvitation sent to unechoed-one",
         )
-        attio.query_list_entries.return_value = [sent_entry, ghost_entry]
+        attio.query_list_entries.return_value = [sent_entry, unechoed_entry]
+        stub_guard_reread(attio, [sent_entry, unechoed_entry])
 
         def cache_side_effect(rid):
             return {
-                "rec-sent-001": ("Sent One", "Co", "https://linkedin.com/in/sent-one", "", ""),
-                "rec-ghost-001": ("Ghost One", "Co", "https://linkedin.com/in/ghost-one", "", ""),
+                "rec-sent-001": ("Sent One", "Co A", "https://linkedin.com/in/sent-one", "", ""),
+                "rec-unechoed-001": ("Unechoed One", "Co B", "https://linkedin.com/in/unechoed-one", "", ""),
             }[rid]
 
         with patch("workflows.daily_check.RecordCache.get", side_effect=cache_side_effect), \
              patch("workflows.daily_check.can_send_connections", return_value=True), \
-             patch("workflows.daily_check.record_connections"), \
-             patch("workflows.daily_check.record_visits"), \
-             patch("workflows.daily_check.emit_pb_silent_no_op") as mock_silent, \
-             patch("workflows.daily_check.get_remaining",
-                   return_value={"connections": 25, "messages": 30, "visits": 50}), \
-             patch("workflows.daily_check.write_prospects_to_sheet", return_value="https://docs.google.com/spreadsheets/d/fake"):
-            run_connection_requests(
+             patch("workflows.daily_check.record_connections") as mock_record, \
+             patch("workflows.daily_check.write_prospects_to_sheet", return_value="https://docs.google.com/spreadsheets/d/fake"), \
+             patch("workflows.daily_check.emit_pb_silent_no_op") as mock_emit:
+            result = run_connection_requests(
                 attio=attio,
                 pb=pb,
                 network_booster_id="agent-nb-001",
@@ -650,21 +699,119 @@ class TestDailyConnectionsIntegration:
                 daily_run=fake_daily_run(),
             )
 
-        # Both rows advance optimistically; no silent-no-op on a clean launch.
-        assert attio.update_list_entry.call_count == 2
-        advanced_entry_ids = {
-            c.kwargs["entry_id"] for c in attio.update_list_entry.call_args_list
+        # Both requested rows advance — the CSV-unechoed one included.
+        stage_calls = [c for c in attio.update_list_entry.call_args_list
+                       if "stage" in c.kwargs.get("entry_attributes", {})]
+        assert len(stage_calls) == 2
+        advanced = {}
+        for update_call in stage_calls:
+            attrs = update_call[1].get("entry_attributes", update_call[0][1] if len(update_call[0]) > 1 else {})
+            advanced[update_call[1]["entry_id"]] = attrs["stage"]
+        assert advanced == {
+            "entry-sent-001": "Connection Sent",
+            "entry-unechoed-001": "Connection Sent",
         }
-        assert advanced_entry_ids == {"entry-sent-001", "entry-ghost-001"}
-        mock_silent.assert_not_called()
+        assert result["sent"] == 2
+        assert result["attio_updated"] == 2
+        # The daily cap is charged for every requested row (charge parity
+        # with what actually left the account), and no dry-skip row opens.
+        mock_record.assert_called_once_with(2)
+        mock_emit.assert_not_called()
+        out = capsys.readouterr().out
+        assert "OPTIMISTICALLY" not in out
+        assert INVITE_OPTIMISTIC_ADVANCE not in out
 
     @patch.dict(os.environ, {
         "ATTIO_LIST_ID": "list-001", "ATTIO_API_KEY": "fake", "PHANTOMBUSTER_API_KEY": "fake",
         "GSHEET_AUTOCONNECT_ID": "fake-sheet-id",
         "PB_LI_SESSION_COOKIE": "fake-cookie", "PB_LI_USER_AGENT": "TestAgent/1.0", "STRICT_PRE_INVITE_DEGREE_CHECK": "false",
     })
-    def test_connection_sent_included_in_batch_for_recheck(self):
-        """CONNECTION_SENT profiles are added to the Google Sheet batch with empty message."""
+    def test_connection_requests_cap_restriction_disables_optimistic_advance(self, capsys):
+        """Hard block of the optimistic advance: a LinkedIn cap/restriction
+        signal in the launch log means invites after the cap were silently
+        DROPPED, so the authoritative-advance override is OFF and the batch
+        falls back to per-row CSV confirmation. Only the row the CSV marks
+        "Message sent" advances; the unechoed row stays at Prospect and
+        re-queues tomorrow. No `INVITE_OPTIMISTIC_ADVANCE` marker is stamped
+        or announced, and the cap is charged only for the confirmed send.
+        (An empty CSV under auth failure takes the dry-skip path — see
+        `test_connection_requests_takes_dry_skip_path_when_gate_fails`.)
+        """
+        from clients.pb_envelope import INVITE_OPTIMISTIC_ADVANCE
+        from workflows.daily_check import run_connection_requests
+
+        confirmed_entry = _make_attio_entry(
+            entry_id="entry-cap-001",
+            record_id="rec-cap-001",
+            stage="Prospect",
+            quality_score=75,
+        )
+        dropped_entry = _make_attio_entry(
+            entry_id="entry-cap-002",
+            record_id="rec-cap-002",
+            stage="Prospect",
+            quality_score=75,
+        )
+        attio = _attio_with_full_schema()
+        attio._person_to_company = {
+            "rec-cap-001": "company-cap-a",
+            "rec-cap-002": "company-cap-b",
+        }
+        pb = _typed_pb_mock(
+            csv_text=_make_sn_csv([{
+                "query": "https://linkedin.com/in/cap-one",
+                "linkedinProfileUrl": "https://linkedin.com/in/cap-one",
+                "status": "Message sent",
+            }]),
+            log="Invitation sent to cap-one\n⚠️ You've reached the weekly invitation limit.",
+        )
+        attio.query_list_entries.return_value = [confirmed_entry, dropped_entry]
+        stub_guard_reread(attio, [confirmed_entry, dropped_entry])
+
+        def cache_side_effect(rid):
+            return {
+                "rec-cap-001": ("Cap One", "Co A", "https://linkedin.com/in/cap-one", "", ""),
+                "rec-cap-002": ("Cap Two", "Co B", "https://linkedin.com/in/cap-two", "", ""),
+            }[rid]
+
+        with patch("workflows.daily_check.RecordCache.get", side_effect=cache_side_effect), \
+             patch("workflows.daily_check.can_send_connections", return_value=True), \
+             patch("workflows.daily_check.record_connections") as mock_record, \
+             patch("workflows.daily_check.write_prospects_to_sheet", return_value="https://docs.google.com/spreadsheets/d/fake"), \
+             patch("workflows.daily_check.emit_pb_silent_no_op") as mock_emit:
+            result = run_connection_requests(
+                attio=attio,
+                pb=pb,
+                network_booster_id="agent-nb-cap",
+                auto_confirm=True,
+                daily_run=fake_daily_run(),
+            )
+
+        # Only the CSV-confirmed row advances; the dropped row stays put.
+        stage_calls = [c for c in attio.update_list_entry.call_args_list
+                       if "stage" in c.kwargs.get("entry_attributes", {})]
+        assert len(stage_calls) == 1
+        assert stage_calls[0].kwargs["entry_id"] == "entry-cap-001"
+        # `sent` counts provider-confirmed new invites.
+        assert result["sent"] == 1
+        assert result["pb_queued"] == 2
+        assert result["attio_updated"] == 1
+        mock_record.assert_called_once_with(1)
+        mock_emit.assert_not_called()
+        out = capsys.readouterr().out
+        assert "OPTIMISTICALLY" not in out
+        assert INVITE_OPTIMISTIC_ADVANCE not in out
+
+    @patch.dict(os.environ, {
+        "ATTIO_LIST_ID": "list-001", "ATTIO_API_KEY": "fake", "PHANTOMBUSTER_API_KEY": "fake",
+        "GSHEET_AUTOCONNECT_ID": "fake-sheet-id",
+        "PB_LI_SESSION_COOKIE": "fake-cookie", "PB_LI_USER_AGENT": "TestAgent/1.0", "STRICT_PRE_INVITE_DEGREE_CHECK": "false",
+    })
+    def test_launch_sheet_contains_only_invite_rows(self):
+        """2026-06-10 re-check removal: the Network Booster launch sheet must
+        contain ONLY invite rows — CONNECTION_SENT profiles never ride along
+        as empty-message "re-check" visit rows (Phase 0 owns acceptance
+        detection)."""
         from workflows.daily_check import run_connection_requests
 
         prospect_entry = _make_attio_entry(
@@ -680,15 +827,13 @@ class TestDailyConnectionsIntegration:
             quality_score=80,
         )
 
-        attio = MagicMock()
-        attio.is_person_company_corrupted.return_value = False
-        # F-PR-5: CSV must mark the Prospect URL as "Message sent" so the
-        # advance gate fires for that entry. The re-check (Ana Ejemplo) is
-        # NOT a send and stays unchanged regardless of CSV content.
+        attio = _attio_with_full_schema()
         pb = _typed_pb_mock(
-            csv_text="query,status\nhttps://linkedin.com/in/carlosejemplo,Message sent\n",
+            csv_text="query,status\nhttps://linkedin.com/in/carlosmendoza,Message sent\n",
+            log="Invitation sent to carlosmendoza",
         )
         attio.query_list_entries.return_value = [prospect_entry, conn_sent_entry]
+        stub_guard_reread(attio, [prospect_entry, conn_sent_entry])
 
         captured_sheet_rows = []
 
@@ -699,13 +844,11 @@ class TestDailyConnectionsIntegration:
         with patch("workflows.daily_check.RecordCache.get") as mock_cache, \
              patch("workflows.daily_check.can_send_connections", return_value=True), \
              patch("workflows.daily_check.record_connections"), \
-             patch("workflows.daily_check.record_visits"), \
-             patch("workflows.daily_check.get_remaining",
-                   return_value={"connections": 25, "messages": 30, "visits": 50}), \
+             patch("workflows.daily_check.get_remaining", return_value={"connections": 25, "messages": 30, "visits": 50}), \
              patch("workflows.daily_check.write_prospects_to_sheet", side_effect=fake_write):
             mock_cache.side_effect = lambda rid: {
-                "rec-p-001": ("Carlos Ejemplo", "CEMENTRA", "https://linkedin.com/in/carlosejemplo", "", ""),
-                "rec-cs-010": ("Ana Ejemplo", "Cementra", "https://linkedin.com/in/anaejemplo", "", ""),
+                "rec-p-001": ("Carlos Mendoza", "CEMEX", "https://linkedin.com/in/carlosmendoza", "", ""),
+                "rec-cs-010": ("Ana García", "Cemex", "https://linkedin.com/in/anagarcia", "", ""),
             }[rid]
             result = run_connection_requests(
                 attio=attio,
@@ -715,23 +858,22 @@ class TestDailyConnectionsIntegration:
                 daily_run=fake_daily_run(),
             )
 
-        # Both profiles should be in the sheet
-        assert len(captured_sheet_rows) == 2
+        # Exactly the invite row — the CONNECTION_SENT profile must NOT be
+        # in the sheet, and no row may carry an empty (re-check) message.
+        assert [r["linkedInUrl"] for r in captured_sheet_rows] == [
+            "https://linkedin.com/in/carlosmendoza"
+        ]
+        assert all(len(r["message"]) > 0 for r in captured_sheet_rows)
 
-        # Prospect has a message, CONNECTION_SENT has empty message
-        prospect_row = next(r for r in captured_sheet_rows if r["linkedInUrl"] == "https://linkedin.com/in/carlosejemplo")
-        recheck_row = next(r for r in captured_sheet_rows if r["linkedInUrl"] == "https://linkedin.com/in/anaejemplo")
-        assert len(prospect_row["message"]) > 0
-        assert recheck_row["message"] == ""
-
-        # Only Prospect entry should be updated to Connection Sent (not the re-check)
-        update_calls = attio.update_list_entry.call_args_list
+        # Only the Prospect entry advances to Connection Sent.
+        update_calls = [c for c in attio.update_list_entry.call_args_list
+                        if "stage" in c.kwargs.get("entry_attributes", {})]
         assert len(update_calls) == 1
         updated_entry_id = update_calls[0][1].get("entry_id", update_calls[0][0][0] if update_calls[0][0] else None)
         assert updated_entry_id == "entry-p-001"
 
         assert result["sent"] == 1
-        assert result["rechecked"] == 1
+        assert "rechecked" not in result
 
 
 # ── C. Daily Check — DM Sequencing ──────────────────────────────────────────
@@ -761,17 +903,18 @@ class TestDailyDMsIntegration:
         # F-PR-5: CSV must mark "Message sent" for the advance gate to pass.
         pb = _typed_pb_mock(
             csv_text=_make_sn_csv([{
-                "query": "https://linkedin.com/in/anaejemplo",
-                "linkedinProfileUrl": "https://linkedin.com/in/anaejemplo",
+                "query": "https://linkedin.com/in/anagarcia",
+                "linkedinProfileUrl": "https://linkedin.com/in/anagarcia",
                 "status": "Message sent",
             }]),
         )
         attio.query_list_entries.return_value = [entry]
+        stub_guard_reread(attio, [entry])
 
         with patch("workflows.daily_check.RecordCache.get") as mock_cache_get, \
              patch("workflows.daily_check.can_send_messages", return_value=True), \
              patch("workflows.daily_check.write_prospects_to_sheet", return_value="https://docs.google.com/spreadsheets/d/fake"):
-            mock_cache_get.return_value = ("Ana Ejemplo", "Cementra", "https://linkedin.com/in/anaejemplo", "", "")
+            mock_cache_get.return_value = ("Ana García", "Cemex", "https://linkedin.com/in/anagarcia", "", "")
             result = run_dm_sequencing(
                 attio=attio,
                 pb=pb,
@@ -872,6 +1015,7 @@ class TestDailyDMsIntegration:
             }]),
         )
         attio.query_list_entries.return_value = [entry]
+        stub_guard_reread(attio, [entry])
 
         with patch("workflows.daily_check.RecordCache.get") as mock_cache_get, \
              patch("workflows.daily_check.can_send_messages", return_value=True), \
@@ -896,7 +1040,7 @@ class TestDailyDMsIntegration:
         "GSHEET_AUTOCONNECT_ID": "fake-sheet-id",
         "PB_LI_SESSION_COOKIE": "fake-cookie", "PB_LI_USER_AGENT": "TestAgent/1.0", "STRICT_PRE_INVITE_DEGREE_CHECK": "false",
     })
-    def test_dm_sequencing_takes_dry_skip_path_when_csv_missing(self):
+    def test_dm_sequencing_reports_failed_batch_when_csv_missing(self):
         """F-PR-5: when PB emits no result CSV, the advance gate FAILS
         (csv_status='Empty', sent_count=0). The old log-fallback path
         was removed — log scraping is no longer trusted because PB
@@ -916,6 +1060,7 @@ class TestDailyDMsIntegration:
         # CSV missing → advance gate fails → dry-skip path.
         pb = _typed_pb_mock(csv_text=None)
         attio.query_list_entries.return_value = [entry]
+        stub_guard_reread(attio, [entry])
 
         with patch("workflows.daily_check.RecordCache.get") as mock_cache_get, \
              patch("workflows.daily_check.can_send_messages", return_value=True), \
@@ -930,13 +1075,14 @@ class TestDailyDMsIntegration:
                 auto_confirm=True,
             )
 
-        # F-PR-5: advance gate failed → dry-skip. Attio NOT updated; queue
+        # F-PR-5: advance gate failed. Attio NOT updated; queue
         # row opened so operator sees the silent-no-op.
         attio.update_list_entry.assert_not_called()
         mock_emit.assert_called_once()
-        # The dry_skipped key on the result dict records the requested count
-        # (1 prospect) that was held back from advancing.
-        assert result.get("dry_skipped", {}).get("dm1") == 1
+        # Approved provider failure stays distinct from an intentional skip.
+        assert result["failed_batches"][0]["requested"] == 1
+        assert result["failed_batches"][0]["step"] == "dm1"
+        assert "dm1" not in result.get("dry_skipped", {})
 
     @patch.dict(os.environ, {
         "ATTIO_LIST_ID": "list-001", "ATTIO_API_KEY": "fake", "PHANTOMBUSTER_API_KEY": "fake",
@@ -972,6 +1118,7 @@ class TestDailyDMsIntegration:
             }]),
         )
         attio.query_list_entries.return_value = [entry]
+        stub_guard_reread(attio, [entry])
 
         with patch("workflows.daily_check.RecordCache.get") as mock_cache_get, \
              patch("workflows.daily_check.can_send_messages", return_value=True), \
@@ -1054,6 +1201,7 @@ class TestDailyDMsIntegration:
         attio = _attio_with_full_schema()
         pb = MagicMock()
         attio.query_list_entries.return_value = [entry]
+        stub_guard_reread(attio, [entry])
         # Typed contract: launch_agent returns PBLaunch;
         # wait_for_completion RAISES on error (no more silent dict return).
         launch = PBLaunch(
@@ -1132,6 +1280,7 @@ class TestDailyDMsIntegration:
             ]),
         )
         attio.query_list_entries.return_value = [entry]
+        stub_guard_reread(attio, [entry])
 
         with patch("workflows.daily_check.RecordCache.get") as mock_cache_get, \
              patch("workflows.daily_check.can_send_messages", return_value=True), \
@@ -1191,6 +1340,7 @@ class TestDailyDMsIntegration:
              "status": "Message sent"},
         ]))
         attio.query_list_entries.return_value = [entry]
+        stub_guard_reread(attio, [entry])
 
         with patch("workflows.daily_check.RecordCache.get") as mock_cache_get, \
              patch("workflows.daily_check.can_send_messages", return_value=True), \
@@ -1229,7 +1379,7 @@ class TestDailyDMsIntegration:
                                last_contact_date=two_days_ago, dm_step=0)
         e2 = _make_attio_entry("entry-dup-2", "rec-dup-2", "Accepted",
                                last_contact_date=two_days_ago, dm_step=0)
-        attio = _attio_with_full_schema()
+        attio = _attio_with_full_schema(_person_to_company={})
         pb = _typed_pb_mock(csv_text=_make_sn_csv([
             {"query": "https://linkedin.com/in/dupperson",
              "linkedinProfileUrl": "https://linkedin.com/in/dupperson",
@@ -1239,6 +1389,7 @@ class TestDailyDMsIntegration:
              "status": "Message sent"},
         ]))
         attio.query_list_entries.return_value = [e1, e2]
+        stub_guard_reread(attio, [e1, e2])
 
         with patch("workflows.daily_check.RecordCache.get") as mock_cache_get, \
              patch("workflows.daily_check.can_send_messages", return_value=True), \
@@ -1285,8 +1436,9 @@ class TestDailyDMsIntegration:
             for i in range(35)
         ]
 
-        attio = _attio_with_full_schema()
+        attio = _attio_with_full_schema(_person_to_company={})
         attio.query_list_entries.return_value = entries
+        stub_guard_reread(attio, entries)
         # F-PR-5: 30 bulk URLs all marked "Message sent" so the
         # advance gate passes for every queued prospect.
         bulk_csv_rows = [
@@ -1336,7 +1488,8 @@ class TestDailyDMsIntegration:
         """
         from workflows.daily_check import run_dm_sequencing
 
-        today_minus = lambda d: (date.today() - timedelta(days=d)).isoformat()
+        def today_minus(d):
+            return (date.today() - timedelta(days=d)).isoformat()
         entries = []
         # DM3 eligible: DM2_SENT, last_contact >= 10 days ago, dm_step=2
         for i in range(2):
@@ -1357,8 +1510,9 @@ class TestDailyDMsIntegration:
                 stage="Accepted", last_contact_date=today_minus(2), dm_step=0,
             ))
 
-        attio = _attio_with_full_schema()
+        attio = _attio_with_full_schema(_person_to_company={})
         attio.query_list_entries.return_value = entries
+        stub_guard_reread(attio, entries)
         # F-PR-5: 5 DM1 URLs all marked "Message sent" to pass the gate.
         prio_csv_rows = [
             {

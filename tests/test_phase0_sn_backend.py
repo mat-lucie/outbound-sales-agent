@@ -135,11 +135,9 @@ def test_phase0_sales_nav_backend_launches_with_identities_injection(monkeypatch
     assert payload["spreadsheetUrl"] == "https://sheet-url.example"
 
     # Assertion 6: numberOfProfilesPerLaunch overridden to the actual batch
-    # size + 1 sheet header line (PB counts the header as a processable line
-    # — 2026-06-12 incident: with count=1 the phantom processed ONLY the
-    # literal header and the run went BLIND).
-    assert payload["numberOfProfilesPerLaunch"] == 2, (
-        "numberOfProfilesPerLaunch must be batch + 1 header line (1 stale URL + 1)"
+    # size. The scraper sheet contains URLs only.
+    assert payload["numberOfProfilesPerLaunch"] == 1, (
+        "numberOfProfilesPerLaunch must match the one URL in the scraper sheet"
     )
 
     # Assertion 7: other saved fields preserved (saveImg, takeScreenshot).

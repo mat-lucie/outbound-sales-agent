@@ -29,11 +29,17 @@ Output contract (parsed by the follow-up review step — keep it stable):
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import random
 import re
 import sys
+import threading
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from pathlib import Path
 
@@ -298,7 +304,75 @@ def warn(message: str) -> None:
     print(f"gmail_sweep: {message}", file=sys.stderr)
 
 
-def list_all(svc, q):
+class ReadPacer:
+    """One admission clock and cooldown shared by every sweep worker.
+
+    Two reads/second cost at most 4,800 units/minute at Google's current
+    40-unit threads.get price, below the 6,000-unit new-project quota.
+    Other processes can consume the same user's budget; retries still matter.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._next = 0.0
+
+    def wait(self):
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                delay = self._next - now
+                if delay <= 0:
+                    self._next = now + 0.5
+                    return
+            time.sleep(delay)
+
+    def cooldown(self, seconds):
+        with self._lock:
+            self._next = max(self._next, time.monotonic() + seconds)
+
+
+def execute_read(request, pacer):
+    """Retry only typed transient API errors; keep exhausted reads visible."""
+    from googleapiclient.errors import HttpError
+
+    for attempt in range(8):
+        pacer.wait()
+        try:
+            return request.execute()
+        except HttpError as exc:
+            status = exc.resp.status
+            try:
+                reasons = {
+                    error.get("reason")
+                    for error in json.loads(exc.content).get("error", {}).get("errors", [])
+                }
+            except (ValueError, TypeError, AttributeError):
+                reasons = set()
+            transient = status in {429, 500, 502, 503, 504} or (
+                status == 403
+                and bool(reasons & {"rateLimitExceeded", "userRateLimitExceeded"})
+            )
+            if not transient or attempt == 7:
+                raise
+            delay = min(2 ** attempt, 64) + random.random()
+            # Honor both Retry-After formats. An excessive or invalid wait
+            # remains a reported failure instead of retrying prematurely.
+            retry_after = exc.resp.get("retry-after")
+            if retry_after is not None:
+                try:
+                    delay = max(delay, float(retry_after))
+                except ValueError:
+                    try:
+                        delay = max(delay, parsedate_to_datetime(retry_after).timestamp() - time.time())
+                    except (ValueError, TypeError, OverflowError):
+                        raise exc from None
+            if not 0 <= delay <= 120:
+                raise
+            pacer.cooldown(delay)
+            warn(f"temporary Gmail read error {status}; retry {attempt + 1}/7 after {delay:.1f}s")
+
+
+def list_all(svc, q, *, pacer=None):
     """Page through users().messages().list until exhausted.
 
     Returns ``(messages, pages, complete)``. ``complete`` is False when the
@@ -306,11 +380,12 @@ def list_all(svc, q):
     — so the caller can report "sweep incomplete" with the partial result
     instead of dying and printing nothing at all.
     """
+    pacer = pacer or ReadPacer()
     out, token, pages, seen = [], None, 0, set()
     while True:
         try:
-            resp = svc.users().messages().list(
-                userId="me", q=q, maxResults=500, pageToken=token).execute()
+            resp = execute_read(svc.users().messages().list(
+                userId="me", q=q, maxResults=500, pageToken=token), pacer)
         except Exception as exc:
             warn(f"page {pages + 1} of {q!r} failed: {exc!r}")
             return out, pages, False
@@ -328,24 +403,41 @@ def list_all(svc, q):
         seen.add(token)
 
 
-def fetch_threads(svc, thread_ids):
+def fetch_threads(svc, thread_ids, *, worker_services=None, pacer=None):
     """Fetch thread metadata. Returns ``(threads, failed_ids)``.
 
     A thread that fails to fetch vanishes from the radar in exactly the way
     this script's worst bug did, so failures are NAMED — ids returned and
     warned to stderr — never just counted.
     """
+    pacer = pacer or ReadPacer()
+
+    def fetch_chunk(service, ids):
+        found, errors = {}, []
+        for tid in ids:
+            try:
+                found[tid] = execute_read(service.users().threads().get(
+                    userId="me", id=tid, format="metadata",
+                    metadataHeaders=["From", "To", "Cc", "Subject", "Date",
+                                     "Auto-Submitted"]
+                ), pacer)
+            except Exception as exc:
+                errors.append(tid)
+                warn(f"thread {tid} fetch failed: {exc!r}")
+        return found, errors
+
+    services = [svc, *(worker_services or [])]
+    ids = list(thread_ids)
+    if len(services) == 1:
+        return fetch_chunk(svc, ids)
+    # googleapiclient services share an httplib2 transport and are not safe
+    # to call from multiple threads. Give each worker its own service.
+    chunks = [ids[i::len(services)] for i in range(len(services))]
     threads, failed = {}, []
-    for tid in thread_ids:
-        try:
-            threads[tid] = svc.users().threads().get(
-                userId="me", id=tid, format="metadata",
-                metadataHeaders=["From", "To", "Cc", "Subject", "Date",
-                                 "Auto-Submitted"]
-            ).execute()
-        except Exception as exc:
-            failed.append(tid)
-            warn(f"thread {tid} fetch failed: {exc!r}")
+    with ThreadPoolExecutor(max_workers=len(services)) as pool:
+        for found, errors in pool.map(fetch_chunk, services, chunks):
+            threads.update(found)
+            failed.extend(errors)
     return threads, failed
 
 
@@ -440,44 +532,71 @@ def group_counterparties(threads):
     return out
 
 
-def main():
+def run_sweep(*, cache_path=None, force_full=False):
     if not internal_domains():
-        raise SystemExit(
-            "gmail_sweep: no operator mail domain configured, so a sent "
-            "message is indistinguishable from a received one and every "
-            "thread would report as owed. Set OUTBOUND_INTERNAL_DOMAINS "
-            "(comma-separated, e.g. 'acme.com,acme.io') or a display-named "
-            "EMAIL_FROM / EMAIL_REPLY_TO in your .env."
-        )
+        raise ValueError("Configure OUTBOUND_INTERNAL_DOMAINS or EMAIL_FROM before a Gmail sweep")
+    started = time.monotonic()
     client = GmailClient.from_credentials()
-    # GmailClient exposes only per-prospect lookups; the sweep needs raw
-    # thread listing + pagination, so it drives the underlying service.
     svc = client._service
+    pacer = ReadPacer()
+    workers = None
 
-    sent_msgs, sent_pages, sent_ok = list_all(svc, "in:sent newer_than:90d")
-    inb_msgs, inb_pages, inb_ok = list_all(svc, "newer_than:90d -in:sent")
+    def fetch(service, ids):
+        nonlocal workers
+        if workers is None:
+            try:
+                workers = [GmailClient.from_credentials()._service for _ in range(3)] if ids else []
+            except Exception as exc:
+                warn(f"parallel Gmail setup failed ({type(exc).__name__}); fetching serially")
+                workers = []
+        return fetch_threads(service, ids, worker_services=workers, pacer=pacer)
 
-    thread_ids = {}
-    for m in sent_msgs + inb_msgs:
-        thread_ids[m["threadId"]] = True
-
-    threads, failed_threads = fetch_threads(svc, thread_ids)
-
+    if cache_path is not None:
+        from workflows.gmail_inventory import collect_inventory
+        threads, result = collect_inventory(
+            svc, cache_path, list_all=lambda service, q: list_all(service, q, pacer=pacer),
+            fetch_threads=fetch, read=lambda request: execute_read(request, pacer),
+            warn=warn, max_pages=MAX_PAGES, force_full=force_full,
+        )
+    else:
+        sent, sent_pages, sent_ok = list_all(svc, "in:sent newer_than:90d", pacer=pacer)
+        inbound, inbound_pages, inbound_ok = list_all(svc, "newer_than:90d -in:sent", pacer=pacer)
+        ids = {m["threadId"] for m in sent + inbound}
+        threads, failed = fetch(svc, ids)
+        result = {
+            "sent_msgs": len(sent), "sent_pages": sent_pages,
+            "inbound_msgs": len(inbound), "inbound_pages": inbound_pages,
+            "unique_threads": len(ids), "fetch_errors": len(failed),
+            "sweep_complete": bool(sent_ok and inbound_ok and not failed),
+            "failed_thread_ids": sorted(failed), "inventory_mode": "uncached",
+            "cache_hits": 0, "thread_reads_requested": len(ids),
+        }
     out = group_counterparties(threads)
     out.sort(key=lambda r: (-int(r["ball_mine"]), -r["latest_ms"]))
-    print(json.dumps({
-        "sent_msgs": len(sent_msgs), "sent_pages": sent_pages,
-        "inbound_msgs": len(inb_msgs), "inbound_pages": inb_pages,
-        "unique_threads": len(thread_ids),
-        "fetch_errors": len(failed_threads),
-        # Anything below true means counterparties may be MISSING from the
-        # list above — the digest must say so rather than present the sweep
-        # as complete.
-        "sweep_complete": bool(sent_ok and inb_ok and not failed_threads),
-        "failed_thread_ids": failed_threads[:50],
-        "counterparties": out,
-    }, default=str))
+    result.update(counterparties=out, wall_seconds=round(time.monotonic() - started, 3))
+    return result
+
+
+
+def cli():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cache", type=Path, default=Path(os.environ.get(
+        "OUTBOUND_GMAIL_INVENTORY", str(Path.home() / ".outbound-agent/gmail-inventory.json"))))
+    parser.add_argument("--full-refresh", action="store_true",
+                        help="Ignore metadata cache and perform an audited full refresh")
+    parser.add_argument("--no-cache", action="store_true", help="Do not read or write local inventory")
+    args = parser.parse_args()
+    print(json.dumps(run_sweep(cache_path=None if args.no_cache else args.cache,
+                               force_full=args.full_refresh), default=str))
+
+
+
+
+
+def main():
+    """Uncached programmatic inventory entry point."""
+    print(json.dumps(run_sweep(), default=str))
 
 
 if __name__ == "__main__":
-    main()
+    cli()

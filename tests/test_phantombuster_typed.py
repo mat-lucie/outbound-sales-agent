@@ -104,6 +104,7 @@ class TestWaitForCompletion:
     def test_status_finished_returns_completion(self, pb_client) -> None:
         with patch.object(pb_client, "get_container_output") as mock_out:
             mock_out.return_value = {
+                "containerId": "c_42",
                 "status": "finished",
                 "isAgentRunning": False,
                 "output": "log lines\nCSV saved at https://x.csv",
@@ -119,6 +120,7 @@ class TestWaitForCompletion:
         """No more silent error return."""
         with patch.object(pb_client, "get_container_output") as mock_out:
             mock_out.return_value = {
+                "containerId": "c_42",
                 "status": "error",
                 "isAgentRunning": False,
                 "output": "PB error: session cookie expired",
@@ -134,6 +136,7 @@ class TestWaitForCompletion:
         """Always-running responses → PBRunTimeout (typed, not bare TimeoutError)."""
         with patch.object(pb_client, "get_container_output") as mock_out:
             mock_out.return_value = {
+                "containerId": "c_42",
                 "status": "running",
                 "isAgentRunning": True,
             }
@@ -150,6 +153,7 @@ class TestWaitForCompletion:
         launch = self._launch()
         with patch.object(pb_client, "get_container_output") as mock_out:
             mock_out.return_value = {
+                "containerId": "c_42",
                 "status": "finished",
                 "isAgentRunning": False,
                 "output": "ok",
@@ -238,6 +242,7 @@ class TestNoResendInvariant:
         )
         with patch.object(pb_client, "get_container_output") as mock_out:
             mock_out.return_value = {
+                "containerId": "c_chokepoint",
                 "status": "error",
                 "isAgentRunning": False,
                 "output": "anything",

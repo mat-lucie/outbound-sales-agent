@@ -179,6 +179,29 @@ def set_callback(
     )
 
 
+def clear_callback(
+    writer: AttioWriter,
+    *,
+    object: str,
+    record_id: str,
+    list_id: str | None = None,
+) -> dict:
+    """Null a discharged callback — the tickler fired and Mat acted on it.
+
+    Without this, a fired callback could only be cleared by a manual Attio
+    edit outside the §3.15 sole-writer contract, and the account could not
+    enter the WAITING cycle (callback + waiting must never coexist — the
+    radar hard-surfaces a due callback over WAITING every run).
+    """
+    return _apply(
+        writer,
+        object=object,
+        record_id=record_id,
+        updates={"followup_callback_date": None},
+        list_id=list_id,
+    )
+
+
 # Loud-typo bounds for a verified touch. One day of FUTURE skew is legitimate
 # (the skill layer extracts dates from UTC timestamps, which read "tomorrow"
 # during the operator's evening); anything further future would silently hide

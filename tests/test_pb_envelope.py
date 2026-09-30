@@ -14,7 +14,6 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from clients.pb_envelope import (
-    INVITE_OPTIMISTIC_ADVANCE,
     PBCompletion,
     PBLaunch,
     PBRunFailed,
@@ -459,13 +458,13 @@ class TestInviteOptimisticAdvance:
     def test_network_cookie_invalid_not_authenticated(self) -> None:
         assert invite_launch_authenticated(_completion(log="error: network-cookie-invalid")) is False
 
-    def test_optimistic_advance_on_clean_authenticated_launch(self) -> None:
+    def test_clean_launch_without_per_person_confirmation_does_not_advance(self) -> None:
         req = {"https://www.linkedin.com/in/a", "https://www.linkedin.com/in/b"}
         out = compute_invite_outcome(self._parsed_skipped(req), _completion(log="Adding... finished"), req)
-        assert out.csv_status == "Message sent"
-        assert out.sent_urls == frozenset(req)
-        assert out.sent_count == 2
-        assert should_advance_batch(_launch(), out) is True
+        assert out.csv_status == "Skipped"
+        assert out.sent_urls == frozenset()
+        assert out.sent_count == 0
+        assert should_advance_batch(_launch(), out) is False
 
     def test_auth_failure_does_not_advance(self) -> None:
         req = {"https://www.linkedin.com/in/a"}
@@ -473,7 +472,7 @@ class TestInviteOptimisticAdvance:
         assert out.csv_status == "Skipped"
         assert should_advance_batch(_launch(), out) is False
 
-    def test_already_processed_left_for_pattern_a_path(self) -> None:
+    def test_already_processed_is_not_delivery_evidence(self) -> None:
         req = {"https://www.linkedin.com/in/a"}
         parsed = SendOutcome(
             container_id="c_123", csv_status="Skipped", sent_count=0, requested_count=1,
@@ -481,8 +480,8 @@ class TestInviteOptimisticAdvance:
             skipped_urls=frozenset(req), already_processed=True,
         )
         out = compute_invite_outcome(parsed, _completion(), req)
-        assert out.already_processed is True
-        assert out.csv_status == "Skipped"  # unchanged: the existing Pattern-A branch handles it
+        assert out.already_processed is False
+        assert out.csv_status == "Skipped"
 
     def test_empty_requested_unchanged(self) -> None:
         # recheck-only batch (no invites) — nothing to optimistically advance.
@@ -527,8 +526,8 @@ class TestInviteCapRestrictionGuard:
         assert out.csv_status == "Skipped"
         assert should_advance_batch(_launch(), out) is False
 
-    def test_optimistic_advance_stamps_audit_sentinel(self) -> None:
+    def test_unconfirmed_launch_stamps_shortfall(self) -> None:
         req = {"https://www.linkedin.com/in/a"}
         out = compute_invite_outcome(self._parsed_skipped(req), _completion(log="Adding... finished"), req)
-        assert out.csv_status == "Message sent"
-        assert out.drift_skipped_reason == INVITE_OPTIMISTIC_ADVANCE
+        assert out.csv_status == "Skipped"
+        assert out.drift_skipped_reason == "invite_log_confirmed_0_of_1"

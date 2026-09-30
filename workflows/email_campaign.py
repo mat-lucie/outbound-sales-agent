@@ -22,14 +22,12 @@ from models.email_campaign import (
     personalize_email,
 )
 from models.pipeline import PipelineStage
-
-# TODO: extract `_assert_no_unresolved_placeholders` (and `_PLACEHOLDER_RE`,
-# `UnresolvedPlaceholderError`) from workflows.daily_check into a shared module
-# (e.g. utils/placeholder_guard.py) so this isn't a cross-workflow private
-# import. Reused as-is for now to keep this fix surgical.
 from workflows.content_guard import assert_content_replaced
 from workflows.cross_channel_suppression import build_suppression_set
-from workflows.daily_check import _assert_no_unresolved_placeholders
+from workflows.daily_check_helpers import (
+    _assert_email_not_blank,
+    _assert_email_renderable,
+)
 from workflows.email_compliance import (
     already_sent,
     append_footer,
@@ -38,6 +36,7 @@ from workflows.email_compliance import (
     mark_sent,
 )
 from workflows.email_lane_gate import assert_email_lane_enabled
+from workflows.email_send_guard import verify_email_send_preconditions
 from workflows.email_sequencer import get_pending_email, is_weekday
 
 # LinkedIn pipeline stages that count as "active" for anti-collision
@@ -411,10 +410,30 @@ def run_email_daily(
     total_to_send = len(email1_batch) + len(sequence_batch)
     collisions = 0
     sent = 0
+    send_guard_skipped = 0
 
     if total_to_send == 0:
         click.echo("No emails due today.")
         return {"sent": 0, "collisions": 0}
+
+    # Pre-flight: a blank template is systemic (per step+language, not per
+    # contact), so validate every distinct template the batch will use BEFORE
+    # any send. This halts at zero sends — mirroring the DM batch guard —
+    # instead of mid-loop after earlier contacts already shipped. The
+    # per-send guard below remains as backstop for render-level blanks.
+    for language in sorted({c["language"] for c in email1_batch}):
+        template = get_email_template(EmailStep.EMAIL1, language)
+        _assert_email_not_blank(
+            template["subject"], template["body_html"],
+            f"the {language} template", "email1",
+        )
+    sequence_templates = {(step, c["language"]) for c, step in sequence_batch}
+    for step, language in sorted(sequence_templates, key=lambda p: (p[0].value, p[1])):
+        template = get_email_template(step, language)
+        _assert_email_not_blank(
+            template["subject"], template["body_html"],
+            f"the {language} template", step.value,
+        )
 
     click.echo(f"\nReady to send: {len(email1_batch)} new (Email 1) + {len(sequence_batch)} sequenced")
 
@@ -438,10 +457,7 @@ def run_email_daily(
         subject = personalize_email(template["subject"], contact["first_name"], contact["company"])
         body = personalize_email(template["body_html"], contact["first_name"], contact["company"])
 
-        _assert_no_unresolved_placeholders(
-            [{"message": f"{subject}\n{body}", "linkedInUrl": contact["email"]}],
-            "email1",
-        )
+        _assert_email_renderable(subject, body, contact["email"], "email1")
 
         stage_update = {
             "email_campaign_stage": EmailStage.EMAIL1_SENT.value,
@@ -449,6 +465,12 @@ def run_email_daily(
             "email_campaign_started": today_str,
         }
 
+        if not dry_run:
+            guard = verify_email_send_preconditions(attio, contact["record_id"], contact["stage"])
+            if not guard.allowed:
+                send_guard_skipped += 1
+                click.echo(f"  [send_guard] email1 skipped for {contact['email']}: {guard.reason}", err=True)
+                continue
         if dry_run:
             click.echo(f"  [DRY RUN] email1 | {contact['first_name']} {contact['last_name']} | {contact['email']} | {contact['company']} | {contact['language']} | {subject}")
         elif already_sent(contact["record_id"], "email1"):
@@ -471,7 +493,7 @@ def run_email_daily(
                 text=text,
                 headers=list_unsubscribe_header(),
             )
-            mark_sent(contact["record_id"], "email1", today)
+            _record_send_or_raise(contact["record_id"], "email1", contact["email"], today, send_resp)
             # Capture the Resend message id (PR-243, forward-compat thread
             # matching); falls back without it until the attribute exists.
             _update_person_with_resend_id_fallback(
@@ -494,10 +516,7 @@ def run_email_daily(
         subject = personalize_email(template["subject"], contact["first_name"], contact["company"])
         body = personalize_email(template["body_html"], contact["first_name"], contact["company"])
 
-        _assert_no_unresolved_placeholders(
-            [{"message": f"{subject}\n{body}", "linkedInUrl": contact["email"]}],
-            step.value,
-        )
+        _assert_email_renderable(subject, body, contact["email"], step.value)
 
         next_stage = NEXT_STAGE[step]
         # After Email 3, mark as completed
@@ -507,6 +526,12 @@ def run_email_daily(
             "email_campaign_last_sent": today_str,
         }
 
+        if not dry_run:
+            guard = verify_email_send_preconditions(attio, contact["record_id"], contact["stage"])
+            if not guard.allowed:
+                send_guard_skipped += 1
+                click.echo(f"  [send_guard] {step.value} skipped for {contact['email']}: {guard.reason}", err=True)
+                continue
         if dry_run:
             click.echo(f"  [DRY RUN] {step.value} | {contact['first_name']} {contact['last_name']} | {contact['email']} | {contact['company']} | {contact['language']} | {subject}")
         elif already_sent(contact["record_id"], step.value):
@@ -527,7 +552,7 @@ def run_email_daily(
                 text=text,
                 headers=list_unsubscribe_header(),
             )
-            mark_sent(contact["record_id"], step.value, today)
+            _record_send_or_raise(contact["record_id"], step.value, contact["email"], today, send_resp)
             # Capture the Resend message id (PR-243, forward-compat thread
             # matching); falls back without it until the attribute exists.
             _update_person_with_resend_id_fallback(
@@ -545,5 +570,29 @@ def run_email_daily(
         "sent": sent,
         "collisions": collisions,
         "email1": len(email1_batch) - collisions,
+        "send_guard_skipped": send_guard_skipped,
         "suppressed": suppressed_skipped,
     }
+
+
+def _record_send_or_raise(
+    record_id: str, step: str, email: str, day: date, send_resp: dict | None
+) -> None:
+    """Persist the sent-ledger entry immediately after a successful Resend send.
+
+    If the ledger write itself fails, re-raise with an UNMISSABLE message: the
+    email already went out, so the default "just re-run" instinct would
+    double-send. The raised error names the recipient and Resend id and tells
+    the operator not to blindly re-run.
+    """
+    try:
+        mark_sent(record_id, step, day)
+    except Exception as exc:
+        resend_id = (send_resp or {}).get("id", "?")
+        raise RuntimeError(
+            f"{step} email WAS sent to {email} (Resend id {resend_id}) but could "
+            f"NOT be recorded in the sent-ledger: {exc!r}. Do NOT blindly re-run "
+            f"— the CRM stage may also be un-advanced, and a re-run without first "
+            f"repairing the ledger WILL re-send this email. Fix the ledger "
+            f"(~/.outbound-agent/email_sent.json) or record this send manually first."
+        ) from exc

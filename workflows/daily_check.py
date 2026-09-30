@@ -1,5 +1,7 @@
 """Daily check workflow: send connections, sequence DMs, detect responses."""
 
+from __future__ import annotations
+
 import os
 from datetime import UTC, date, datetime, timedelta
 from enum import Enum
@@ -16,17 +18,22 @@ from clients.attio import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from clients.crm.base import CRMProvider
-from clients.google_sheets import profiles_per_launch, write_prospects_to_sheet
+    from clients.phantombuster import PhantomBusterClient
+    from workflows.audit import AuditLogger
+    from workflows.daily_run import DailyRun
+from clients.google_sheets import write_prospects_to_sheet
 from clients.outreach_config import load_outreach_config
 from clients.pb_envelope import (
-    INVITE_OPTIMISTIC_ADVANCE,
+    NETWORK_BOOSTER_BUILTIN_PER_LAUNCH_CAP,
     PBRunFailed,
     PBRunTimeout,
     has_scraper_dedup_marker,
+    invite_launch_advanceable,
     should_advance_batch,
 )
-from clients.phantombuster import PhantomBusterClient
 from clients.sender import BotdogSender, PBSender
 from models.business_calendar import business_days_between, operator_today
 from models.campaign import (
@@ -79,10 +86,14 @@ from workflows.daily_check_helpers import (
     build_sales_nav_launch_args,
     preflight_legacy_profile_scraper,
 )
+from workflows.run_evidence import observed
+from workflows.send_preconditions import verify_send_preconditions
 
-# Intentional re-exports — silence F401. UnresolvedPlaceholderError is
-# imported by cli.py + email_campaign tests; can_send_messages is patched
-# via `workflows.daily_check.can_send_messages` in integration tests.
+# Intentional re-exports — silence F401. UnresolvedPlaceholderError and
+# BlankMessageError are imported by cli.py (curated ⚠ REFUSE handling in
+# the daily / send-dms commands) + email_campaign tests; can_send_messages
+# is patched via `workflows.daily_check.can_send_messages` in integration
+# tests.
 # The SEND_CHANNEL_* constants + _resolve_send_channel live in
 # daily_check_helpers (their home — detect_responses and botdog_ingest
 # cannot import this module without a cycle) and are re-exported here so
@@ -95,11 +106,10 @@ __all__ = [
     "UnresolvedPlaceholderError",
     "_resolve_send_channel",
     "can_send_messages",
+    "record_visits",
 ]
-from workflows.audit import AuditLogger
 from workflows.consistency_sweep import run_company_tally_consistency_sweep
 from workflows.content_guard import assert_content_replaced
-from workflows.daily_run import DailyRun
 from workflows.dm_sequencer import NEXT_STAGE, STAGE_FOR_DM, get_pending_dms
 from workflows.escalation import escalate
 from workflows.metrics import phase_timer, record_phase_or_skip
@@ -194,7 +204,7 @@ PHASE0_PROSPECT_MIN_BUDGET = 10
 SUSPECTED_STALE_MIN_AGE_DAYS = 4
 
 
-def _build_botdog_sender() -> "BotdogSender | None":
+def _build_botdog_sender() -> BotdogSender | None:
     """Construct the OPTIONAL `BotdogSender` for the event drain.
 
     PhantomBuster owns sending: no send path in this module constructs a
@@ -286,7 +296,7 @@ def _build_botdog_sender() -> "BotdogSender | None":
 def _is_blocked_by_stored_floor(
     attrs: dict,
     today: date,
-    audit_logger: "AuditLogger | None" = None,
+    audit_logger: AuditLogger | None = None,
 ) -> bool:
     """Return True if `attrs.next_eligible_send_date` is in the future
     (caller MUST skip the row to honor §3.1).
@@ -345,9 +355,9 @@ class DmDueVerdict(NamedTuple):
     parseable (even on exclusions) so callers can key stage-specific
     escalations — e.g. the L1-6 ACCEPTED-with-null-last_contact_date row.
     """
-    step: "MessageStep | None"
-    reason: "DmExclusionReason | None"
-    stage: "PipelineStage | None"
+    step: MessageStep | None
+    reason: DmExclusionReason | None
+    stage: PipelineStage | None
 
     @property
     def needs_missing_lcd_escalation(self) -> bool:
@@ -370,7 +380,7 @@ def dm_due_step(
     *,
     strict: bool = True,
     honor_stored_floor: bool = True,
-    audit_logger: "AuditLogger | None" = None,
+    audit_logger: AuditLogger | None = None,
 ) -> DmDueVerdict:
     """Single source of truth for the attrs-only DM-due predicate chain (PR-217).
 
@@ -495,7 +505,7 @@ _LANGUAGE_SOURCE_HINTS: dict[LanguageSource, str] = {
 def expected_language_for_entry(
     attio: AttioClient,
     attrs: dict,
-    cache: "RecordCache",
+    cache: RecordCache,
 ) -> Language | None:
     """Re-derive the RAW language an entry's canonical source implies, for the
     fail-closed language guard (PR-240). This returns the raw expectation only;
@@ -608,7 +618,7 @@ def _check_company_throttle_or_skip(
     *,
     attio: AttioClient,
     today: date,
-    audit_logger: "AuditLogger | None" = None,
+    audit_logger: AuditLogger | None = None,
     dry_run: bool = False,
 ) -> bool:
     """PR-13 (B-PD-002) throttle gate.
@@ -667,6 +677,88 @@ def _check_company_throttle_or_skip(
     return False
 
 
+def _dedupe_dm_queues_by_company(
+    dm_queues: dict[MessageStep, list[dict]],
+    *,
+    attio: AttioClient,
+    cache: RecordCache | None = None,
+    audit_logger: AuditLogger | None = None,
+) -> int:
+    """Hold each company to ONE DM per run across the three step queues.
+
+    `company_throttle_permits` reads `last_outreach_at`, which the tally
+    only writes AFTER a confirmed send, so two engaged colleagues at the
+    same company both clear the throttle at queue-build time. The
+    sibling-invite exemption (2026-09-02) widens that window — an
+    invite-stamped company no longer blocks either of them — so the
+    §3.8 one-thread-per-company rule needs the same within-run guard the
+    invite path has (`seen_company_ids` in `_build_invite_send_data`).
+
+    Priority mirrors the cap trim: DM1 first (accept momentum), then
+    DM3 (last chance), then DM2 — and oldest-first (`last_contact_date`
+    ASC) within a step, so the colleague who has waited longest wins;
+    each queue is sorted here because the caller's order is raw Attio
+    pagination order and the cap trim's own sort only runs when the
+    queue is over cap. The deferred row re-evaluates next run,
+    where the sibling's fresh DM stamp throttles it for the window.
+    Rows with no linked company are never deduped (mirrors the
+    throttle's permissive `company_id is None`). Mutates `dm_queues` in
+    place; returns the number of rows deferred. Read-only against Attio
+    (cache lookups only — callers have primed `cache.get` per row), so
+    dry and wet runs preview identically. `cache` is used only to name
+    the deferred person in the console line (operators triage by name,
+    not record id); None falls back to the record id.
+
+    Every deferral also emits a `same_company_run_deferred` audit event
+    naming the row that won the company (§0 #9): the console line
+    scrolls away and the summary only carries a count, so without the
+    event a colleague deferred run after run — e.g. because the kept
+    sibling's send never confirms and the company stamp never lands —
+    would be the same invisible freeze this guard's exemption fixed.
+    No queue row is opened: the deferral is expected to resolve on the
+    next run, and the audit trail is what lets an operator prove when
+    it did not.
+    """
+    # company_id → (record_id, step label) of the row that holds the
+    # company this run; named in the deferral audit event.
+    queued_by_company: dict[str, tuple[str, str]] = {}
+    deferred = 0
+    for step in (MessageStep.DM1, MessageStep.DM3, MessageStep.DM2):
+        dm_queues[step].sort(key=lambda a: str(a.get("last_contact_date") or ""))
+        kept: list[dict] = []
+        for attrs in dm_queues[step]:
+            record_id = str(attrs.get("record_id") or "")
+            company_id = _company_id_for_prospect(attio, record_id)
+            if company_id is not None and company_id in queued_by_company:
+                deferred += 1
+                kept_record_id, kept_step = queued_by_company[company_id]
+                if audit_logger is not None:
+                    audit_logger.event(
+                        "same_company_run_deferred",
+                        record_id=record_id,
+                        company_id=company_id,
+                        step=step.value,
+                        kept_record_id=kept_record_id,
+                        kept_step=kept_step,
+                    )
+                label = record_id
+                if cache is not None:
+                    name, company, _, _, _ = cache.get(record_id)
+                    if name:
+                        label = f"{name} ({company})" if company else name
+                click.echo(
+                    f"  Skipping {step.value} for {label} — a colleague at "
+                    f"the same company is already queued this run (§3.8 "
+                    f"one thread per company); re-evaluated next run."
+                )
+                continue
+            if company_id is not None:
+                queued_by_company[company_id] = (record_id, step.value)
+            kept.append(attrs)
+        dm_queues[step] = kept
+    return deferred
+
+
 def _write_company_throttle_tally(
     *,
     attio: AttioClient,
@@ -676,7 +768,7 @@ def _write_company_throttle_tally(
     experiment_id: str | None,
     today: date,
     writer_module: str = "workflows.daily_check.run_dm_sequencing",
-    audit_logger: "AuditLogger | None" = None,
+    audit_logger: AuditLogger | None = None,
     escalate_failures: list | None = None,
     person_advance_ok: bool | None = None,
 ) -> None:
@@ -831,7 +923,7 @@ def _write_company_throttle_tally(
 
 def _confirmed_dm_advance_attrs(
     *,
-    step: "MessageStep",
+    step: MessageStep,
     next_stage: PipelineStage,
     today: date,
     today_str: str,
@@ -877,13 +969,13 @@ def _finalize_confirmed_dm_send(
     *,
     attio: AttioClient,
     row: dict,
-    step: "MessageStep",
+    step: MessageStep,
     attrs_to_update: dict,
     list_id: str,
     today: date,
     today_str: str,
     experiment_id: str | None,
-    audit_logger: "AuditLogger | None" = None,
+    audit_logger: AuditLogger | None = None,
     escalate_failures: list | None = None,
 ) -> int:
     """Post-confirmed-send per-row finalization: advance the person's
@@ -1450,6 +1542,7 @@ def _escalate_prospect_first_degree_with_depth(
             })
 
 
+@observed("acceptance", "phase")
 def detect_accepted_connections(
     attio: AttioClient,
     pb: PhantomBusterClient,
@@ -1615,6 +1708,7 @@ def detect_accepted_connections(
         return {
             "accepted": 0,
             "checked": 0,
+            "complete": True,
             "deferred": 0,
             "prospects_checked": 0,
             "prospects_accepted": 0,
@@ -1683,6 +1777,7 @@ def detect_accepted_connections(
     # the per-row loop survives and the end-of-function summary surfaces
     # the count loudly.
     helper_escalate_failures: list = []
+    write_failures = 0
     for attrs in candidates:
         url = attrs["linkedin_url"]
         entry = fresh_cache.get(url)
@@ -1703,6 +1798,8 @@ def detect_accepted_connections(
                 prospects_accepted += 1
         elif outcome == "regression":
             prospect_regressions_flagged += 1
+        elif outcome == "skip":
+            write_failures += 1
 
     if not conn_sent_stale and not prospect_stale:
         click.echo(f"  Checked {len(candidates)} profiles, {accepted} accepted (all cached).")
@@ -1725,6 +1822,7 @@ def detect_accepted_connections(
         return {
             "accepted": accepted,
             "checked": len(candidates),
+            "complete": not write_failures and not helper_escalate_failures,
             "cache_hits": cache_hit_count,
             "deferred": 0,
             "prospects_checked": len(prospect_cands),
@@ -1844,7 +1942,9 @@ def detect_accepted_connections(
 
     # Write to Google Sheet and launch Profile Scraper (expects 'profileUrl' column)
     sheet_rows = [{"profileUrl": p["linkedin_url"]} for p in scrape_batch]
-    sheet_url = write_prospects_to_sheet(sheet_rows, columns=["profileUrl"])
+    sheet_url = write_prospects_to_sheet(
+        sheet_rows, columns=["profileUrl"], include_header=False
+    )
 
     if backend == "sales_nav":
         # Already guaranteed non-None by the resolve-time guard above (the
@@ -1863,7 +1963,7 @@ def detect_accepted_connections(
                 pb,
                 sales_nav_profile_scraper_id,
                 spreadsheet_url=sheet_url,
-                launch_count=profiles_per_launch(len(scrape_batch)),
+                launch_count=len(scrape_batch),
             ),
             # PB keys the phantom's processed-inputs DB on the result file
             # name; a fresh name per launch forces re-scrape (Phase 0 exists
@@ -2125,6 +2225,8 @@ def detect_accepted_connections(
                     prospects_accepted += 1
             elif outcome == "regression":
                 prospect_regressions_flagged += 1
+            elif outcome == "skip":
+                write_failures += 1
 
     recheck_cache.record_many(cache_updates)
 
@@ -2219,6 +2321,8 @@ def detect_accepted_connections(
         "accepted": accepted,
         "checked": len(conn_sent),
         "scraped": len(scrape_batch),
+        "complete": (not write_failures and not helper_escalate_failures
+                     and rows_matched == len(scrape_batch) and not dedup_marker),
         "cache_hits": cache_hit_count,
         "deferred": deferred,
         "prospects_checked": len(prospect_cands),
@@ -2233,7 +2337,7 @@ def _advance_already_processed_rows(
     attio: AttioClient,
     list_id: str,
     today: str,
-    audit_logger: "AuditLogger | None" = None,
+    audit_logger: AuditLogger | None = None,
     escalate_failures: list | None = None,
 ) -> int:
     """Advance prospects PB reported as already-invited to CONNECTION_SENT.
@@ -2305,8 +2409,10 @@ def _build_invite_send_data(
     attio: AttioClient,
     cache: RecordCache,
     today: date,
-    audit_logger: "AuditLogger | None",
+    audit_logger: AuditLogger | None,
     dry_run: bool,
+    excluded_linkedin_urls: set[str] | None = None,
+    seen_company_ids: set[str] | None = None,
 ) -> tuple[list[dict], dict]:
     """Scan the sorted `prospects` pool in order and accumulate up to
     `target` connection-note rows into `to_send_data`.
@@ -2336,7 +2442,7 @@ def _build_invite_send_data(
     `language_mismatch`, `missing_copy`, `missing_url`.
     """
     to_send_data: list[dict] = []
-    seen_company_ids: set[str] = set()
+    seen_company_ids = set() if seen_company_ids is None else seen_company_ids
     counts = {
         "company_throttled": 0,
         "same_company_run": 0,
@@ -2344,6 +2450,7 @@ def _build_invite_send_data(
         "language_mismatch": 0,
         "missing_copy": 0,
         "missing_url": 0,
+        "send_guard_skipped": 0,
     }
 
     for attrs in prospects:
@@ -2371,6 +2478,9 @@ def _build_invite_send_data(
             )
             counts["missing_url"] += 1
             continue
+        if excluded_linkedin_urls and _normalize_linkedin_url(linkedin_url) in excluded_linkedin_urls:
+            counts["same_company_run"] += 1
+            continue
         # §3.8 per-company throttle (Attio 14-day window). cache.get above
         # has populated `attio._person_to_company`; the check is cheap.
         if not _check_company_throttle_or_skip(
@@ -2386,6 +2496,12 @@ def _build_invite_send_data(
         if company_id is not None and company_id in seen_company_ids:
             counts["same_company_run"] += 1
             continue
+        if not dry_run:
+            guard = verify_send_preconditions(attio, str(attrs["entry_id"]), attrs["stage"])
+            if not guard.allowed:
+                counts["send_guard_skipped"] += 1
+                click.echo(f"  [send_guard] invite skipped for {attrs['entry_id']}: {guard.reason}", err=True)
+                continue
         persona = Persona.from_attio(attrs.get("persona", "operations_leaders"))
         # Person-level override outranks company-derived guesses; mirrors
         # the DM path so an invite and its follow-up DMs can never render
@@ -2530,6 +2646,7 @@ def _build_invite_send_data(
             "current_stage": attrs["stage"],  # PR-15: for AttioWriter.apply prior_values
             "name": name,
             "company": company,
+            "company_id": company_id,
             "title": title,
             # Thread the quarantine attr through to pre_invite_check for
             # defense-in-depth re-verification of the §3.1 gate.
@@ -2555,6 +2672,76 @@ def _build_invite_send_data(
     return to_send_data, counts
 
 
+INVITE_UNCONFIRMED_HOLD_UNTIL = "2099-12-31"
+
+
+def _hold_invite_batch_before_launch(
+    rows: list[dict], *, attio: AttioClient, list_id: str
+) -> None:
+    """Durably hold every candidate before PB can attempt an invitation.
+
+    A log may omit a real send or the process may crash after launch. Rows
+    without a confirmed stage advance must never be selected automatically
+    on the next run. An operator releases a held Prospect only after checking
+    LinkedIn and the exact PB container.
+    """
+    from clients.attio_writer import AttioWriter, WriteIntent
+
+    writer = AttioWriter(attio=attio)
+    held: list[tuple[dict, str]] = []
+    try:
+        for row in rows:
+            for entry_id in row.get("entry_ids") or [row.get("entry_id")]:
+                if not entry_id:
+                    raise ValueError("Invite candidate has no Attio entry ID")
+                writer.apply(WriteIntent(
+                    object="linkedin_outreach", record_id=entry_id,
+                    updates={"invite_eligible_after": INVITE_UNCONFIRMED_HOLD_UNTIL},
+                    prior_values={"invite_eligible_after": row.get("invite_eligible_after")},
+                    writer_module="workflows.daily_check.run_connection_requests",
+                    is_list_entry=True, list_id=list_id,
+                    companion_record_id=row.get("record_id"),
+                ))
+                held.append((row, entry_id))
+    except Exception:
+        # No PB launch has occurred yet. Restore earlier rows so a partial
+        # Attio failure does not strand them under a 2099 hold.
+        for row, entry_id in reversed(held):
+            try:
+                writer.apply(WriteIntent(
+                    object="linkedin_outreach", record_id=entry_id,
+                    updates={"invite_eligible_after": row.get("invite_eligible_after")},
+                    prior_values={"invite_eligible_after": INVITE_UNCONFIRMED_HOLD_UNTIL},
+                    writer_module="workflows.daily_check.run_connection_requests",
+                    is_list_entry=True, list_id=list_id,
+                    companion_record_id=row.get("record_id"),
+                ))
+            except Exception as rollback_exc:
+                click.echo(
+                    f"  ❌ Prelaunch hold rollback failed for {entry_id}: "
+                    f"{rollback_exc}; manual Attio review required.", err=True,
+                )
+                try:
+                    escalate(
+                        type="pb_invite_unconfirmed",
+                        idempotency_key=f"prelaunch-hold|{entry_id}",
+                        payload={
+                            "container_id": "prelaunch-not-started",
+                            "profile_url": str(row.get("linkedInUrl") or ""),
+                            "record_id": str(row.get("record_id") or ""),
+                            "entry_id": str(entry_id),
+                            "hold_until": INVITE_UNCONFIRMED_HOLD_UNTIL,
+                        }, attio=attio,
+                    )
+                except Exception as queue_exc:
+                    click.echo(
+                        f"  ❌ Review queue write also failed for {entry_id}: "
+                        f"{queue_exc}; manual Attio review required.", err=True,
+                    )
+        raise
+
+
+@observed("invitations", "phase")
 def run_connection_requests(
     attio: AttioClient,
     pb: PhantomBusterClient,
@@ -2570,6 +2757,9 @@ def run_connection_requests(
     *,
     daily_run: DailyRun,
     sender: PBSender | None = None,
+    exclude_entry_ids: set[str] | None = None,
+    exclude_company_ids: set[str] | None = None,
+    exclude_linkedin_urls: set[str] | None = None,
 ) -> dict:
     """Part A: Send connection requests to qualified prospects.
 
@@ -2611,6 +2801,12 @@ def run_connection_requests(
         1 for a in all_parsed
         if _resolve_send_channel(a) == SEND_CHANNEL_BOTDOG
     )
+    if exclude_entry_ids:
+        # A multi-container daily run must not reuse a row if Attio's list
+        # query temporarily lags behind the prelaunch hold write.
+        all_parsed = [
+            a for a in all_parsed if str(a.get("entry_id", "")) not in exclude_entry_ids
+        ]
     if botdog_stamped_total:
         click.echo(
             f"  ⚠ Botdog residual: {botdog_stamped_total} row(s) stamped "
@@ -2622,7 +2818,6 @@ def run_connection_requests(
         )
 
     prospects = []
-    connection_sent = []
     # Channel-stamp guard: a prospect stamped `send_channel=botdog` was
     # handed to another transport, so letting the PB batch pick it up
     # risks the same prospect getting a second invite from a second
@@ -2646,9 +2841,6 @@ def run_connection_requests(
     # KeyErrors on a stage-less entry (unreachable in production —
     # parse_entry always stamps stage).
     for attrs in all_parsed:
-        if attrs["stage"] == PipelineStage.CONNECTION_SENT.value:
-            connection_sent.append(attrs)
-            continue
         reason = invite_slice_reason(attrs, today_op)
         if reason is InviteExclusionReason.NOT_PROSPECT:
             continue
@@ -2748,7 +2940,10 @@ def run_connection_requests(
     # daily connection capacity from BOTH the local file and the daily_run row,
     # plus the batch_size knob. The trim echo names the binding ledger so an
     # operator reconciling a trimmed run against the log looks at the right one.
-    target = min(remaining["connections"], remaining_attio, batch_size)
+    target = min(
+        remaining["connections"], remaining_attio, batch_size,
+        NETWORK_BOOSTER_BUILTIN_PER_LAUNCH_CAP,
+    )
     if target < batch_size:
         if remaining_attio < remaining["connections"]:
             click.echo(
@@ -2771,6 +2966,8 @@ def run_connection_requests(
     to_send_data, skip_counts = _build_invite_send_data(
         prospects, target=target, attio=attio, cache=cache, today=today_op,
         audit_logger=audit_logger, dry_run=dry_run,
+        excluded_linkedin_urls=exclude_linkedin_urls,
+        seen_company_ids=exclude_company_ids,
     )
     skipped_company_throttled = skip_counts["company_throttled"]
     skipped_missing_language = skip_counts["missing_language"]
@@ -2842,68 +3039,15 @@ def run_connection_requests(
                 click.echo(f"      - {row['linkedInUrl']}")
         click.echo(f"  ✓ {len(to_send_data)} confirmed 2nd/3rd-degree → invite queue")
 
-    # Prepare re-check rows for CONNECTION_SENT (empty message — phantom just scrapes).
-    # Cache-skip URLs visited within RECHECK_TTL_DAYS to avoid burning Network
-    # Booster visits on the same profiles every day.
-    recheck_candidates: list[dict] = []
-    for attrs in connection_sent:
-        _, _, linkedin_url, _, _ = cache.get(attrs["record_id"])
-        if not linkedin_url:
-            continue
-        recheck_candidates.append({
-            "linkedInUrl": linkedin_url,
-            "message": "",
-        })
-    candidate_urls = [r["linkedInUrl"] for r in recheck_candidates]
-    _, stale_recheck_urls = recheck_cache.partition(candidate_urls)
-    stale_recheck_set = set(stale_recheck_urls)
-    recheck_data = [r for r in recheck_candidates if r["linkedInUrl"] in stale_recheck_set]
-    cache_hit_rechecks = len(recheck_candidates) - len(recheck_data)
-    if cache_hit_rechecks:
-        click.echo(
-            f"  Cache hit: skipping {cache_hit_rechecks} re-check visits "
-            f"(within {recheck_cache.RECHECK_TTL_DAYS} days)."
-        )
-    recheck_data, dropped_recheck = _dedupe_by_linkedin_url(recheck_data)
-    if dropped_recheck:
-        click.echo(f"  Dropped {len(dropped_recheck)} duplicate re-check URL(s).")
-
-    # Split-brain fix (port of upstream #182): re-checks are profile visits —
-    # trim to the remaining daily visit budget (MIN of the daily_run ledger and
-    # the legacy local file, same dual-source rule as the invite target above).
-    # Visits were previously charged but never gated; the visits_per_day cap now
-    # actually binds. Overflow rows stay stale and re-queue tomorrow —
-    # recheck_cache.record_many below only marks rows that remain in
-    # recheck_data, so trimmed rows are NOT cache-suppressed. The echo names the
-    # binding ledger so the operator reconciles against the right one.
-    remaining_visits_attio = daily_run.remaining("visits")
-    remaining_visits_local = remaining["visits"]
-    remaining_visits = min(remaining_visits_attio, remaining_visits_local)
-    if len(recheck_data) > remaining_visits:
-        kept = max(0, remaining_visits)
-        if remaining_visits_local < remaining_visits_attio:
-            binding_ledger = (
-                f"local file: {remaining_visits_local}; "
-                f"daily_run: {remaining_visits_attio}"
-            )
-        else:
-            binding_ledger = (
-                f"daily_run: {remaining_visits_attio}; "
-                f"local file: {remaining_visits_local}"
-            )
-        click.echo(
-            f"  Trimming re-checks {len(recheck_data)} → {kept} "
-            f"(remaining daily visit budget — {binding_ledger})."
-        )
-        recheck_data = recheck_data[:kept]
-
-    combined = to_send_data + recheck_data
-
-    if not combined:
-        click.echo("No prospects or re-checks ready.")
-        return {"botdog_excluded": botdog_excluded, "botdog_stamped_total": botdog_stamped_total, "sent": 0, "pb_queued": 0, "rechecked": 0, "skipped": 0, "skipped_low_score": skipped_low_score}
-
-    click.echo(f"Prepared {len(to_send_data)} connection requests + {len(recheck_data)} re-checks.")
+    # Acceptance monitoring runs in Phase 0, before invitation delivery.
+    # Never replay CONNECTION_SENT rows through the invitation transport.
+    recheck_data: list[dict] = []
+    if not to_send_data:
+        click.echo("No prospects ready.")
+        return {"botdog_excluded": botdog_excluded, "botdog_stamped_total": botdog_stamped_total,
+                "sent": 0, "pb_queued": 0, "rechecked": 0, "skipped": 0,
+                "skipped_low_score": skipped_low_score}
+    click.echo(f"Prepared {len(to_send_data)} connection requests.")
 
     if dry_run:
         for row in to_send_data:
@@ -2923,7 +3067,7 @@ def run_connection_requests(
             "skipped_low_score": skipped_low_score,
         }
 
-    if not auto_confirm and not click.confirm(f"Send {len(to_send_data)} connections + {len(recheck_data)} re-checks?"):
+    if not auto_confirm and not click.confirm(f"Send {len(to_send_data)} connections?"):
         click.echo("Cancelled.")
         return {"botdog_excluded": botdog_excluded, "botdog_stamped_total": botdog_stamped_total, "sent": 0, "pb_queued": len(to_send_data), "rechecked": 0, "cancelled": True, "skipped_low_score": skipped_low_score}
 
@@ -2959,416 +3103,335 @@ def run_connection_requests(
         daily_run.reserve_send("connections", len(to_send_data))
         if to_send_data else None
     )
-    visit_lease: str | None = None
     try:
-        if recheck_data:
-            visit_lease = daily_run.reserve_send("visits", len(recheck_data))
-        # F-PR-5 advance gate feed. Network Booster's CSV reports per-URL send
-        # status the same way Message Sender does. The sender parses the
-        # outcome (invite override included — its result.csv is unreliable for
-        # per-run send confirmation, so a clean authenticated launch
-        # optimistically advances all requested invites while a dead-cookie /
-        # cap / restriction launch stays Skipped); below we either advance the
-        # rows PB confirmed OR take the dry-skip path with a `pb_silent_no_op`
-        # queue row. Because the override flips csv_status to "Message sent"
-        # with sent_urls = all requested, the standard per-row advance branch
-        # below runs and sets sent_for_cap = outcome.sent_count; a cap-blocked
-        # launch leaves the outcome Skipped → gate-fail branch →
-        # sent_for_cap = 0, so the cap charge matches the rows advanced.
-        pb_result = sender.launch_invite_batch(combined, requested_urls_for_send)
-        launch = pb_result.launch
-        outcome = pb_result.outcome
-        if outcome.drift_skipped_reason == INVITE_OPTIMISTIC_ADVANCE:
-            click.echo(
-                f"  ↪ Advancing {outcome.sent_count} invite(s) OPTIMISTICALLY — "
-                f"Network Booster CSV is unreliable, launch was clean + authenticated "
-                f"with no cap/restriction signal. If a LinkedIn cap was hit silently, "
-                f"verify in the Invitation Manager (these are recoverable via the "
-                f"`{INVITE_OPTIMISTIC_ADVANCE}` audit marker)."
+        _hold_invite_batch_before_launch(to_send_data, attio=attio, list_id=list_id)
+        # Network Booster's cumulative CSV is not per-run delivery evidence.
+        # The sender derives confirmations from this container's per-profile
+        # log; only those URLs may advance below.
+        try:
+            pb_result = sender.launch_invite_batch(
+                to_send_data, requested_urls_for_send
             )
-        # Stamp post-send dates with the operator-local date (today_op) that the
-        # eligibility gate above used — NOT date.today() (UTC). This keeps
-        # last_contact_date in the same TZ frame as is_invite_eligible / cadence
-        # math, so an invite sent near UTC midnight doesn't record a next-day
-        # last_contact_date and shift the whole DM cadence by a day. Mirrors the
-        # operator_today() convention already used for the Phase-0 timeout key.
-        today_iso = today_op.isoformat()
-        # Returns None when no experiment is running (§0 #9 — no silent fallback to
-        # baseline-v0). None is a valid experiment tag meaning "no active experiment".
-        current_experiment_id = get_current_experiment_id()
-        updated = 0
-        # A2: rows advanced via the already-processed (Pattern-A) path. Counted
-        # separately from `updated` (the regular per-row loop) so the summary
-        # line reflects ALL Attio-confirmed advances, not just confirmed-send
-        # advances.
-        already_processed_advanced = 0
-        # Wave-1.6.2 FIX-A (adversarial EXT-SB-1 BLOCKING): tally failed
-        # `experiment_id_immutability_violation` escalate() calls so we can
-        # surface a loud end-of-batch summary line. See the try/except at the
-        # escalate() call site below for the full rationale.
-        escalate_failed_count = 0
-
-        # Wave-1.6.3 (adversarial follow-up): tally failed escalate() calls
-        # raised inside the post-PB-send helpers (_attio_advance_with_escalation,
-        # _write_company_throttle_tally). Both wrap escalate() in inner
-        # try/except Exception to keep the per-row loop alive; the failure
-        # record is appended here so the end-of-batch summary can surface
-        # the count loudly without losing the row-by-row stage advances.
-        helper_escalate_failures: list = []
-
-        # E-fix: on a gate-fail (pb_silent_no_op) launch the re-check profiles
-        # were NOT reliably visited (dead cookie / cap / restriction), so the
-        # visit lease must confirm 0 and the recheck cache must NOT be stamped
-        # — otherwise tomorrow's run skips a re-check that never happened.
-        batch_advance_gate_failed = False
-
-        if not should_advance_batch(launch, outcome):
-            batch_advance_gate_failed = True
-            if outcome.already_processed and not recheck_data:
-                # Layer 2 (Pattern-A re-prospecting fix): PB Auto Connect reports
-                # these profiles were already invited in a prior launch
-                # ("input-already-processed"). They are NOT a silent no-op — advance
-                # them to CONNECTION_SENT so they leave the invite pool (they were
-                # stuck at PROSPECT, re-queuing forever because the gate only
-                # advanced on "Message sent"). Phase 0 then watches for acceptance.
-                #
-                # GUARDS (pipeline-leakage red line — never mark an un-invited
-                # prospect as CONNECTION_SENT):
-                #   1. `outcome.already_processed` only — a cap/error Skipped never
-                #      lands here (verified by SendOutcome tests).
-                #   2. `not recheck_data` — the phantom is launched on
-                #      `to_send_data + recheck_data` (already-invited CONNECTION_SENT
-                #      re-check rows). The marker is batch-level, so on a MIXED batch
-                #      the recheck rows could trip it even if some invite rows are
-                #      genuinely new. Restrict the advance to invites-only batches
-                #      where "every profile was already processed" unambiguously
-                #      refers to the invite rows. Mixed batches fall through to the
-                #      conservative pb_silent_no_op path (rows re-queue; Layer 1 +
-                #      the recheck-cache clear drain the genuinely-pending ones).
-                click.echo(
-                    f"  ↪ PB reports input-already-processed for "
-                    f"{len(to_send_data)} profile(s) — advancing to CONNECTION_SENT "
-                    f"(already invited; Pattern-A fix), not opening pb_silent_no_op."
-                )
-                # A2: capture the advanced count (previously discarded) so the
-                # summary line below reflects the already-processed advance path,
-                # not just the regular per-row loop's `updated`.
-                already_processed_advanced = _advance_already_processed_rows(
-                    to_send_data,
-                    attio=attio,
-                    list_id=list_id,
-                    today=today_iso,
-                    audit_logger=audit_logger,
-                    escalate_failures=helper_escalate_failures,
-                )
-                sent_for_cap = 0
-            else:
-                if outcome.already_processed:
-                    # already_processed but the batch was mixed with re-check rows:
-                    # do NOT advance (the batch-level marker is ambiguous about which
-                    # rows it refers to). Leaving invites at PROSPECT to re-queue is
-                    # the safe direction; opening pb_silent_no_op preserves the
-                    # existing operator signal.
+        except Exception:
+            # A launch or poll failure can occur after PB starts. Keep the
+            # prelaunch hold and surface every candidate for provider review.
+            for row in to_send_data:
+                try:
+                    escalate(
+                        type="pb_invite_unconfirmed",
+                        idempotency_key=f"launch-unknown|{date.today()}|{row['entry_id']}",
+                        payload={
+                            "container_id": "launch-or-poll-failed",
+                            "profile_url": str(row.get("linkedInUrl") or ""),
+                            "record_id": str(row.get("record_id") or ""),
+                            "entry_id": str(row.get("entry_id") or ""),
+                            "hold_until": INVITE_UNCONFIRMED_HOLD_UNTIL,
+                        }, attio=attio,
+                    )
+                except Exception as queue_exc:
                     click.echo(
-                        "  ⚠ input-already-processed fired on a batch mixed with "
-                        "re-check rows; NOT advancing to avoid a false CONNECTION_SENT "
-                        "(invites stay at PROSPECT and re-queue)."
+                        f"  ❌ Review queue write failed for "
+                        f"{row.get('entry_id')}: {queue_exc}; durable hold remains.",
+                        err=True,
                     )
-                click.echo(
-                    f"  ⚠ PB Network Booster advance gate FAILED "
-                    f"(csv_status={outcome.csv_status}, sent={outcome.sent_count}, "
-                    f"requested={outcome.requested_count}); opening pb_silent_no_op "
-                    f"queue row and skipping Attio updates for this batch."
-                )
-                emit_pb_silent_no_op(
-                    launch,
-                    outcome,
-                    attio=attio,
-                    audit_logger=audit_logger,
-                    experiment_id=current_experiment_id,
-                )
-                # Daily-cap counter charges only the actually-sent count — a
-                # gate-failed batch with sent_count=0 must NOT consume tomorrow's
-                # invite budget for sends that never happened.
-                sent_for_cap = 0
-        else:
-            # Per-row Attio advance: only rows PB confirmed as "Message sent"
-            # advance — others stay at PROSPECT so tomorrow's run retries.
-            # Symmetric with the run_dm_sequencing 3-row-class partition:
-            #   PB-confirmed-sent → stage flip
-            #   PB-explicit-skipped (Already-1st-degree / Invite-limit / etc.)
-            #       → no state mutation, open pb_inmail_dead_end queue row
-            #       so the operator can flag the prospect out manually.
-            #   PB-unreported → no state mutation, retried tomorrow
-            try:
-                for row in to_send_data:
-                    url_key = _normalize_linkedin_url(row.get("linkedInUrl", ""))
-                    if url_key in outcome.skipped_urls:
-                        emit_pb_inmail_dead_end(
-                            launch,
-                            linkedin_url=url_key,
-                            dm_step="invite",
-                            pb_status="skipped_in_csv",
-                            attio=attio,
-                            audit_logger=audit_logger,
-                            experiment_id=current_experiment_id,
-                        )
-                        continue
-                    if url_key not in outcome.sent_urls:
-                        # PB didn't confirm send for this row; leave at PROSPECT.
-                        continue
-                    # Wave-1.6 FIX-2: experiment_id immutability guard for the
-                    # regular invite path. Pre-Wave-1.6 this branch silently
-                    # overwrote any prior PROSPECT-stamped `experiment_id` with
-                    # the experiment running NOW — meaning a row committed
-                    # during exp-A and invited after the exp-A→exp-B switch
-                    # had its cohort tag flipped to exp-B at invite time.
-                    # Production rows from 2026-04-07 / 2026-04-20 confirmed
-                    # the bug fired (see done-qa-advertiser-daily-pass1-round2
-                    # BLOCKING-1). The Pattern-A flip path in
-                    # pre_invite_check.py:_check_experiment_id_immutability
-                    # was guarded; this branch was not.
-                    #
-                    # Wave-1.6-ext FIX-2' (adversarial SB-4): we used to `raise
-                    # ExperimentIdImmutableError` here, but the raise fires
-                    # AFTER PB has already physically launched all invites in
-                    # the batch (line 849). Raising mid-loop orphans rows that
-                    # PB sent for but haven't been Attio-advanced yet — those
-                    # rows stay at PROSPECT and tomorrow's run re-invites them
-                    # (the §3.1 hard red line FIX-2 was supposed to prevent).
-                    #
-                    # Behavior now: preserve prior (cohort tag honored), still
-                    # advance the stage to CONNECTION_SENT (no re-invite), and
-                    # open an Operator Review Queue row via
-                    # `experiment_id_immutability_violation` so the cohort
-                    # mismatch is visible. Continue processing the batch — no
-                    # raise, no orphans. See done-qa-adversarial-pass1-round2
-                    # finding SB-4.
-                    prior_experiment_id = row.get("experiment_id")
-                    effective_experiment_id = (
-                        prior_experiment_id
-                        if prior_experiment_id is not None
-                        else current_experiment_id
-                    )
-                    if (
-                        prior_experiment_id is not None
-                        and current_experiment_id is not None
-                        and prior_experiment_id != current_experiment_id
-                    ):
-                        # Wave-1.6.2 FIX-A (adversarial EXT-SB-1 BLOCKING):
-                        # the escalate() call here MUST NOT take down the loop.
-                        # If it raises (transient Attio 5xx, network blip, payload
-                        # schema drift during F1 deploy race, etc.), the
-                        # surrounding `for row in to_send_data:` loop terminates
-                        # and rows AFTER this offender never get the
-                        # CONNECTION_SENT stage advance at lines below. Since PB
-                        # has already physically launched invites for those rows
-                        # (line 849), tomorrow's run would re-invite them — the
-                        # exact §3.1 red-line FIX-2'/FIX-A was sold as fixing.
-                        #
-                        # The catch is intentionally broad (Exception) BECAUSE the
-                        # alternative (orphan re-invites) is strictly worse than
-                        # a swallowed escalate failure. We log loud + tally for
-                        # an end-of-batch ERROR summary; we DO NOT skip the
-                        # stage advance. The escalate call is best-effort — the
-                        # row's experiment_id_frozen_at="connection_sent" stamp
-                        # below preserves the prior cohort so the immutability
-                        # semantic FIX-2' protects still holds at the data layer.
-                        try:
-                            escalate(
-                                type="experiment_id_immutability_violation",
-                                idempotency_key=(
-                                    f"experiment-id-immutability"
-                                    f"|{row.get('record_id') or ''}"
-                                    f"|{prior_experiment_id}"
-                                    f"|{current_experiment_id}"
-                                ),
-                                payload={
-                                    "record_id": str(row.get("record_id") or ""),
-                                    "entry_id": row.get("entry_id") or "",
-                                    "prior_experiment_id": prior_experiment_id,
-                                    "current_experiment_id": current_experiment_id,
-                                    "effective_experiment_id": prior_experiment_id,
-                                    "context": (
-                                        "regular_invite_success_path: PB confirmed "
-                                        "send. Preserving prior experiment_id; row "
-                                        "still advances to CONNECTION_SENT so it "
-                                        "does not re-invite tomorrow."
-                                    ),
-                                },
-                                attio=attio,
-                            )
-                        except Exception as esc_exc:  # noqa: BLE001 — see comment above
-                            escalate_failed_count += 1
-                            click.echo(
-                                f"  ⚠ escalate(experiment_id_immutability_violation) "
-                                f"failed for record_id={row.get('record_id')!r} "
-                                f"(prior_experiment_id={prior_experiment_id!r}, "
-                                f"current_experiment_id={current_experiment_id!r}) "
-                                f"[{type(esc_exc).__name__}]: {esc_exc}. "
-                                f"Continuing batch — stage advance still fires so "
-                                f"the row is NOT re-invited tomorrow. End-of-batch "
-                                f"summary will surface this failure.",
-                                err=True,
-                            )
-
-                    for entry_id in row.get("entry_ids") or [row.get("entry_id")]:
-                        if not entry_id:
-                            continue
-                        # PR-21 (Lesson 4 / fold-in BLOCKING-1): invite-success path
-                        # must also stamp experiment_id_frozen_at="connection_sent"
-                        # so the `connection_sent` enum value is actually used. Guard
-                        # by effective_experiment_id is not None — no stamp on
-                        # no-experiment rows (mirrors Phase 0 pattern in
-                        # detect_accepted_connections).
-                        invite_advance_attrs: dict = {
-                            "stage": PipelineStage.CONNECTION_SENT.value,
-                            "last_contact_date": today_iso,
-                            "experiment_id": effective_experiment_id,
-                        }
-                        if effective_experiment_id is not None:
-                            invite_advance_attrs["experiment_id_frozen_at"] = "connection_sent"
-                        _attio_advance_with_escalation(
-                            attio=attio,
-                            entry_id=entry_id,
-                            entry_attributes=invite_advance_attrs,
-                            list_id=list_id,
-                            linkedin_url=row.get("linkedInUrl", ""),
-                            today=today_iso,
-                            step_label="invite",
-                            writer_module="workflows.daily_check.run_connection_requests",
-                            # Wave-2-B fix-up (code-reviewer B1): real prior
-                            # from the to_send_data row, not the upstream-
-                            # filter invariant (PROSPECT). The row dict is
-                            # built upstream from the eligible-prospect
-                            # parsed-entry attrs at line ~1140 — `current_stage`
-                            # holds the actual value at PB-send time.
-                            prior_stage=row.get("current_stage")
-                                        or row.get("stage")
-                                        or PipelineStage.PROSPECT.value,
-                            person_record_id=row.get("record_id"),
-                            audit_logger=audit_logger,
-                            escalate_failures=helper_escalate_failures,
-                        )
-                        updated += 1
-                    # PR-13 (§3.15): tally Companies.last_outreach_at + 3 siblings
-                    # right after each confirmed invite so multi-thread ABM
-                    # scenarios (two persons at same company in same batch)
-                    # don't both leak through the throttle.
-                    person_record_id = row.get("record_id")
-                    if person_record_id:
-                        # `today_iso` is the iso-string assigned earlier in this
-                        # function (the post-PB-send block). Parse back to date for
-                        # the tally helper's typed signature; the helper writes
-                        # the ISO datetime back to Attio internally.
-                        today_date = date.fromisoformat(today_iso)
-                        _write_company_throttle_tally(
-                            attio=attio,
-                            company_id=_company_id_for_prospect(attio, person_record_id),
-                            person_record_id=person_record_id,
-                            step_label="invite",
-                            experiment_id=current_experiment_id,
-                            today=today_date,
-                            writer_module="workflows.daily_check.run_connection_requests",
-                            audit_logger=audit_logger,
-                            escalate_failures=helper_escalate_failures,
-                        )
-            except Exception:
-                # The deliberately re-raised programmer-bug classes
-                # (UnauthorizedAttioWriteError / monotonicity / terminal-class
-                # regression) from _attio_advance_with_escalation — or any other
-                # raise inside this advance loop — abort the batch BEFORE the
-                # confirm below, so the `finally` REFUNDS the connections + visits
-                # leases even though PB already physically launched this invite
-                # batch. Mirror Part A's post-launch charge-failure echo so the
-                # abort never looks like a clean pre-send failure.
-                click.echo(
-                    f"  ❌ ERROR: PB Network Booster launch completed "
-                    f"({len(to_send_data)} invite(s) sent) but advancing the rows "
-                    f"FAILED before the daily_run charge. The invites MAY HAVE BEEN "
-                    f"PHYSICALLY SENT but are now UNCHARGED (the connections + visits "
-                    f"leases refund on this abort). Verify today's sends in the "
-                    f"LinkedIn Invitation Manager and reconcile the daily_run "
-                    f"counters before the next run.",
-                    err=True,
-                )
-                raise
-            # Charge the cap for confirmed-sent rows only.
-            sent_for_cap = outcome.sent_count
-
-        # Charge the daily_run row + local mirror in lockstep, AS SOON AS
-        # sent_for_cap is known. sent_for_cap is the same value the legacy
-        # local path charged in every reachable branch (0 on a gate-fail /
-        # silent-no-op / already-processed batch, outcome.sent_count on a
-        # per-row advance-pass). record_connections fires inside this guarded
-        # span so a transport error at confirm time leaves neither ledger
-        # charged.
+            raise
+        launch = pb_result.launch
+        completion = pb_result.completion
+        outcome = pb_result.outcome
+        # Only newly sent invitations consume today's quota. Previously
+        # pending invitations still warrant an Attio stage advance.
+        newly_sent_urls = outcome.sent_urls - outcome.already_pending_urls
         try:
             if conn_lease is not None:
-                daily_run.confirm_lease(conn_lease, confirmed_count=sent_for_cap)
+                daily_run.confirm_lease(conn_lease, confirmed_count=len(newly_sent_urls))
                 conn_lease = None
-                # Legacy local mirror (~/.outbound-agent/daily_limits.json):
-                # still read by `cli limits` / get_status() and the local
-                # belt-and-braces gate at the top of this function. Charged
-                # here, in lockstep with the daily_run confirm.
-                record_connections(sent_for_cap)
-            if visit_lease is not None:
-                # Re-checks are profile visits; a clean launch visited them all
-                # — the CSV carries no per-run visit status to refund from, so
-                # the full reservation commits. But on a gate-fail
-                # (pb_silent_no_op) the launch did NOT cleanly visit anything,
-                # so confirm 0 (refunds the reservation) rather than charging
-                # for visits that never happened.
-                visits_charged = 0 if batch_advance_gate_failed else len(recheck_data)
-                daily_run.confirm_lease(visit_lease, confirmed_count=visits_charged)
-                visit_lease = None
-                record_visits(visits_charged)
+                # Legacy local mirror (~/.outbound-agent/daily_limits.json): still
+                # read by `cli limits` / get_status() and the local belt-and-
+                # braces gate at the top of this function. Charged here, in the
+                # same guarded span as the Attio confirm, so the two ledgers
+                # cannot drift if a later stage-advance raises. (Charge parity:
+                # outcome.sent_count is the same value the old sent_for_cap path
+                # used in every reachable branch.)
+                record_connections(len(newly_sent_urls))
         except (httpx.HTTPStatusError, httpx.RequestError):
-            # PB has ALREADY sent this batch — only the daily_run charge
-            # failed (confirm_lease rolled back and re-raised). Without this
-            # echo the abort looks like a clean pre-send failure. The rows
-            # advanced above stay advanced; tomorrow's run re-queues anything
-            # that did not. The pre-invite degree check + PB's
-            # input-already-processed marker are the safety nets against an
-            # actual duplicate invite.
+            # PB has ALREADY sent this batch — only the Attio charge failed
+            # (confirm_lease rolled back and re-raised). Without this echo
+            # the abort looks like a clean pre-send failure. The rows below
+            # never advance, so tomorrow's run will re-queue them; the
+            # pre-invite degree check is the safeguard against a duplicate
+            # invite; PB's processed-inputs marker is not delivery proof.
             click.echo(
-                f"  ❌ ERROR: PB launch completed ({sent_for_cap} invite(s) "
-                f"sent, {len(recheck_data)} re-check(s)) but charging the "
-                f"daily_run row FAILED on a transport error. Verify today's "
+                f"  ❌ ERROR: PB launch completed ({outcome.sent_count} invite(s) "
+                f"sent) but charging the Attio "
+                f"daily_run row FAILED on a transport error. Stage advances were "
+                f"skipped — these rows will re-queue tomorrow. Verify today's "
                 f"sends in the LinkedIn Invitation Manager before the next run.",
                 err=True,
             )
             raise
     finally:
-        # Release only what confirm_lease didn't consume — any raise in the
-        # reserve -> launch -> wait -> csv -> parse -> advance -> confirm span
-        # refunds the reservation (mirrors the DM block's quota-leak guard; an
-        # unreleased lease would silently starve tomorrow's budget for
-        # capacity never used).
+        # Release only what confirm_lease didn't consume — any raise in
+        # the reserve → launch → wait → csv → parse → confirm span
+        # refunds the reservation (mirrors the DM block's quota-leak
+        # guard; an unreleased lease would silently starve tomorrow's
+        # invite budget for capacity never used).
         if conn_lease is not None:
             daily_run.release_lease(conn_lease)
-        if visit_lease is not None:
-            daily_run.release_lease(visit_lease)
-    # Mark visited URLs in the recheck cache so tomorrow's run skips them.
-    # Skip on a gate-fail: those profiles were NOT reliably visited, so
-    # stamping them would suppress a needed re-check next run.
-    if recheck_data and not batch_advance_gate_failed:
-        recheck_cache.record_many({row["linkedInUrl"]: None for row in recheck_data})
-    # L3-3: honest summary. "queued N" = prepared for PB; "advanced M" =
-    # Attio-confirmed. A2: the total now spans BOTH advance paths — the
-    # regular per-row loop (`updated`, confirmed sends) AND the already-
-    # processed Pattern-A path (`already_processed_advanced`). Pre-fix the
-    # latter was discarded, so a batch healed entirely via already-processed
-    # logged "advanced 0" despite every row advancing. Print both when they
-    # differ so operators can spot real PB send-phantom gaps.
-    total_advanced = updated + already_processed_advanced
+    if outcome.sent_count < len(requested_urls_for_send):
+        missing = sorted(requested_urls_for_send - outcome.sent_urls)
+        click.echo(
+            f"  ⚠ Network Booster confirmed {outcome.sent_count}/"
+            f"{len(requested_urls_for_send)} invitations in container "
+            f"{launch.container_id}; {len(missing)} remain unconfirmed at "
+            f"PROSPECT. Review provider and LinkedIn state before retrying."
+        )
+        if audit_logger is not None:
+            audit_logger.event(
+                "pb_invite_unconfirmed",
+                container_id=launch.container_id,
+                requested=len(requested_urls_for_send),
+                confirmed=outcome.sent_count,
+                urls=missing,
+            )
+        for row in to_send_data:
+            row_url = _normalize_linkedin_url(row.get("linkedInUrl", ""))
+            if row_url not in missing:
+                continue
+            try:
+                escalate(
+                    type="pb_invite_unconfirmed",
+                    idempotency_key=f"{launch.container_id}|{row_url}",
+                    payload={
+                        "container_id": launch.container_id,
+                        "profile_url": row_url,
+                        "record_id": str(row.get("record_id") or ""),
+                        "entry_id": str(row.get("entry_id") or ""),
+                        "hold_until": INVITE_UNCONFIRMED_HOLD_UNTIL,
+                    },
+                    attio=attio,
+                )
+            except Exception as exc:
+                click.echo(
+                    f"  ❌ Failed to open pb_invite_unconfirmed review for "
+                    f"{row_url}: {exc}. Durable Attio hold remains.", err=True,
+                )
+    send_date = today_op.isoformat()
+    # Returns None when no experiment is running (§0 #9 — no silent fallback to
+    # baseline-v0). None is a valid experiment tag meaning "no active experiment".
+    current_experiment_id = get_current_experiment_id()
+    updated = 0
+    # Wave-1.6.2 FIX-A (adversarial EXT-SB-1 BLOCKING): tally failed
+    # `experiment_id_immutability_violation` escalate() calls so we can
+    # surface a loud end-of-batch summary line. See the try/except at the
+    # escalate() call site below for the full rationale.
+    escalate_failed_count = 0
+
+    # Wave-1.6.3 (adversarial follow-up): tally failed escalate() calls
+    # raised inside the post-PB-send helpers (_attio_advance_with_escalation,
+    # _write_company_throttle_tally). Both wrap escalate() in inner
+    # try/except Exception to keep the per-row loop alive; the failure
+    # record is appended here so the end-of-batch summary can surface
+    # the count loudly without losing the row-by-row stage advances.
+    helper_escalate_failures: list = []
+
+    if not should_advance_batch(launch, outcome):
+        click.echo(
+            f"  ⚠ PB Network Booster confirmed no invitations "
+            f"(requested={outcome.requested_count}); opening pb_silent_no_op "
+            f"and leaving every row at PROSPECT."
+        )
+        emit_pb_silent_no_op(
+            launch,
+            outcome,
+            attio=attio,
+            audit_logger=audit_logger,
+            experiment_id=current_experiment_id,
+        )
+    else:
+        # Per-row Attio advance: only rows PB confirmed as "Message sent"
+        # advance — others stay at PROSPECT for provider/LinkedIn review.
+        # Symmetric with the run_dm_sequencing 3-row-class partition:
+        #   PB-confirmed-sent → stage flip
+        #   PB-unconfirmed → no state mutation; inspect before retrying
+        for row in to_send_data:
+            url_key = _normalize_linkedin_url(row.get("linkedInUrl", ""))
+            if url_key in outcome.skipped_urls:
+                emit_pb_inmail_dead_end(
+                    launch,
+                    linkedin_url=url_key,
+                    dm_step="invite",
+                    pb_status="skipped_in_csv",
+                    attio=attio,
+                    audit_logger=audit_logger,
+                    experiment_id=current_experiment_id,
+                )
+                continue
+            if url_key not in outcome.sent_urls:
+                # PB didn't confirm send for this row; leave at PROSPECT.
+                continue
+            # Wave-1.6 FIX-2: experiment_id immutability guard for the
+            # regular invite path. Pre-Wave-1.6 this branch silently
+            # overwrote any prior PROSPECT-stamped `experiment_id` with
+            # the experiment running NOW — meaning a row committed
+            # during exp-A and invited after the exp-A→exp-B switch
+            # had its cohort tag flipped to exp-B at invite time.
+            # Production rows from 2026-04-07 / 2026-04-20 confirmed
+            # the bug fired (see done-qa-advertiser-daily-pass1-round2
+            # BLOCKING-1). The Pattern-A flip path in
+            # pre_invite_check.py:_check_experiment_id_immutability
+            # was guarded; this branch was not.
+            #
+            # Wave-1.6-ext FIX-2' (adversarial SB-4): we used to `raise
+            # ExperimentIdImmutableError` here, but the raise fires
+            # AFTER PB has already physically launched all invites in
+            # the batch (line 849). Raising mid-loop orphans rows that
+            # PB sent for but haven't been Attio-advanced yet — those
+            # rows stay at PROSPECT and tomorrow's run re-invites them
+            # (the §3.1 hard red line FIX-2 was supposed to prevent).
+            #
+            # Behavior now: preserve prior (cohort tag honored), still
+            # advance the stage to CONNECTION_SENT (no re-invite), and
+            # open an Operator Review Queue row via
+            # `experiment_id_immutability_violation` so the cohort
+            # mismatch is visible. Continue processing the batch — no
+            # raise, no orphans. See done-qa-adversarial-pass1-round2
+            # finding SB-4.
+            prior_experiment_id = row.get("experiment_id")
+            effective_experiment_id = (
+                prior_experiment_id
+                if prior_experiment_id is not None
+                else current_experiment_id
+            )
+            if (
+                prior_experiment_id is not None
+                and current_experiment_id is not None
+                and prior_experiment_id != current_experiment_id
+            ):
+                # Wave-1.6.2 FIX-A (adversarial EXT-SB-1 BLOCKING):
+                # the escalate() call here MUST NOT take down the loop.
+                # If it raises (transient Attio 5xx, network blip, payload
+                # schema drift during F1 deploy race, etc.), the
+                # surrounding `for row in to_send_data:` loop terminates
+                # and rows AFTER this offender never get the
+                # CONNECTION_SENT stage advance at lines below. Since PB
+                # has already physically launched invites for those rows
+                # (line 849), tomorrow's run would re-invite them — the
+                # exact §3.1 red-line FIX-2'/FIX-A was sold as fixing.
+                #
+                # The catch is intentionally broad (Exception) BECAUSE the
+                # alternative (orphan re-invites) is strictly worse than
+                # a swallowed escalate failure. We log loud + tally for
+                # an end-of-batch ERROR summary; we DO NOT skip the
+                # stage advance. The escalate call is best-effort — the
+                # row's experiment_id_frozen_at="connection_sent" stamp
+                # below preserves the prior cohort so the immutability
+                # semantic FIX-2' protects still holds at the data layer.
+                try:
+                    escalate(
+                        type="experiment_id_immutability_violation",
+                        idempotency_key=(
+                            f"experiment-id-immutability"
+                            f"|{row.get('record_id') or ''}"
+                            f"|{prior_experiment_id}"
+                            f"|{current_experiment_id}"
+                        ),
+                        payload={
+                            "record_id": str(row.get("record_id") or ""),
+                            "entry_id": row.get("entry_id") or "",
+                            "prior_experiment_id": prior_experiment_id,
+                            "current_experiment_id": current_experiment_id,
+                            "effective_experiment_id": prior_experiment_id,
+                            "context": (
+                                "regular_invite_success_path: PB confirmed "
+                                "send. Preserving prior experiment_id; row "
+                                "still advances to CONNECTION_SENT so it "
+                                "does not re-invite tomorrow."
+                            ),
+                        },
+                        attio=attio,
+                    )
+                except Exception as esc_exc:  # noqa: BLE001 — see comment above
+                    escalate_failed_count += 1
+                    click.echo(
+                        f"  ⚠ escalate(experiment_id_immutability_violation) "
+                        f"failed for record_id={row.get('record_id')!r} "
+                        f"(prior_experiment_id={prior_experiment_id!r}, "
+                        f"current_experiment_id={current_experiment_id!r}) "
+                        f"[{type(esc_exc).__name__}]: {esc_exc}. "
+                        f"Continuing batch — stage advance still fires so "
+                        f"the row is NOT re-invited tomorrow. End-of-batch "
+                        f"summary will surface this failure.",
+                        err=True,
+                    )
+
+            for entry_id in row.get("entry_ids") or [row.get("entry_id")]:
+                if not entry_id:
+                    continue
+                # PR-21 (Lesson 4 / fold-in BLOCKING-1): invite-success path
+                # must also stamp experiment_id_frozen_at="connection_sent"
+                # so the `connection_sent` enum value is actually used. Guard
+                # by effective_experiment_id is not None — no stamp on
+                # no-experiment rows (mirrors Phase 0 pattern in
+                # detect_accepted_connections).
+                invite_advance_attrs: dict = {
+                    "stage": PipelineStage.CONNECTION_SENT.value,
+                    "last_contact_date": today,
+                    "experiment_id": effective_experiment_id,
+                }
+                if effective_experiment_id is not None:
+                    invite_advance_attrs["experiment_id_frozen_at"] = "connection_sent"
+                _attio_advance_with_escalation(
+                    attio=attio,
+                    entry_id=entry_id,
+                    entry_attributes=invite_advance_attrs,
+                    list_id=list_id,
+                    linkedin_url=row.get("linkedInUrl", ""),
+                    today=send_date,
+                    step_label="invite",
+                    writer_module="workflows.daily_check.run_connection_requests",
+                    # Wave-2-B fix-up (code-reviewer B1): real prior
+                    # from the to_send_data row, not the upstream-
+                    # filter invariant (PROSPECT). The row dict is
+                    # built upstream from the eligible-prospect
+                    # parsed-entry attrs at line ~1140 — `current_stage`
+                    # holds the actual value at PB-send time.
+                    prior_stage=row.get("current_stage")
+                                or row.get("stage")
+                                or PipelineStage.PROSPECT.value,
+                    person_record_id=row.get("record_id"),
+                    audit_logger=audit_logger,
+                    escalate_failures=helper_escalate_failures,
+                )
+                updated += 1
+            # PR-13 (§3.15): tally Companies.last_outreach_at + 3 siblings
+            # right after each confirmed invite so multi-thread ABM
+            # scenarios (two persons at same company in same batch)
+            # don't both leak through the throttle.
+            person_record_id = row.get("record_id")
+            if person_record_id:
+                # `today` is the iso-string assigned earlier in this
+                # function (line ~744). Parse back to date for the
+                # tally helper's typed signature; the helper writes
+                # the ISO datetime back to Attio internally.
+                today_date = date.fromisoformat(today) if isinstance(today, str) else (today or date.today())
+                _write_company_throttle_tally(
+                    attio=attio,
+                    company_id=_company_id_for_prospect(attio, person_record_id),
+                    person_record_id=person_record_id,
+                    step_label="invite",
+                    experiment_id=current_experiment_id,
+                    today=today_date,
+                    writer_module="workflows.daily_check.run_connection_requests",
+                    audit_logger=audit_logger,
+                    escalate_failures=helper_escalate_failures,
+                )
+    # "Queued" is the attempted batch; only exact provider-confirmed rows
+    # can be counted as sent or advanced.
+    total_advanced = updated
     if total_advanced != len(to_send_data):
         click.echo(
             f"Connection requests: queued {len(to_send_data)}, "
-            f"advanced {total_advanced} (Attio-confirmed"
-            + (f"; {already_processed_advanced} via already-processed"
-               if already_processed_advanced else "")
-            + ")."
+            f"advanced {total_advanced} (provider-confirmed)."
         )
     else:
         click.echo(f"Sent {len(to_send_data)} connection requests. Attio updated: {total_advanced}/{len(to_send_data)}.")
@@ -3406,17 +3469,10 @@ def run_connection_requests(
             f"underlying exceptions.",
             err=True,
         )
-    click.echo(f"Re-checking {len(recheck_data)} CONNECTION_SENT profiles.")
     if skipped_missing_language:
         click.echo(
             f"Skipped {skipped_missing_language} prospect(s) with missing/invalid "
             f"language — see `missing_language` Operator Review Queue rows."
-        )
-    if skipped_language_mismatch:
-        click.echo(
-            f"Skipped {skipped_language_mismatch} prospect(s) whose stored "
-            f"language disagreed with their HQ/lane-derived language — see "
-            f"`language_mismatch` Operator Review Queue rows."
         )
     if skipped_company_throttled:
         throttle_row_note = (
@@ -3428,16 +3484,37 @@ def run_connection_requests(
             f"Skipped {skipped_company_throttled} prospect(s) for per-company "
             f"throttle (§3.8 {DEFAULT_THROTTLE_WINDOW_DAYS}-day window) — {throttle_row_note}."
         )
+    if skipped_language_mismatch:
+        click.echo(
+            f"Skipped {skipped_language_mismatch} prospect(s) whose stored "
+            f"language disagreed with their HQ/lane-derived language — see "
+            f"`language_mismatch` Operator Review Queue rows."
+        )
     if skipped_missing_copy:
         click.echo(
             f"Skipped {skipped_missing_copy} prospect(s) with missing/empty "
             f"message copy — see `missing_copy` Operator Review Queue rows."
         )
     return {
-        "sent": len(to_send_data),
+        "sent": len(newly_sent_urls),
         "pb_queued": len(to_send_data),  # L3-3: honest prep count
+        "unconfirmed": len(requested_urls_for_send - outcome.sent_urls),
+        "provider_restricted": not invite_launch_advanceable(completion),
+        "attempted_company_ids": [
+            str(row["company_id"]) for row in to_send_data if row.get("company_id")
+        ],
+        "attempted_urls": [
+            _normalize_linkedin_url(row["linkedInUrl"])
+            for row in to_send_data if row.get("linkedInUrl")
+        ],
+        "attempted_entry_ids": [
+            str(entry_id)
+            for row in to_send_data
+            for entry_id in (row.get("entry_ids") or [row.get("entry_id")])
+            if entry_id
+        ],
         "attio_updated": updated,
-        "rechecked": len(recheck_data),
+        "send_guard_skipped": skip_counts.get("send_guard_skipped", 0),
         "skipped_missing_language": skipped_missing_language,
         "skipped_language_mismatch": skipped_language_mismatch,
         "skipped_company_throttled": skipped_company_throttled,
@@ -3445,13 +3522,65 @@ def run_connection_requests(
         "skipped_same_company_run": skipped_same_company_run,
         "skipped_missing_url": skipped_missing_url,
         "skipped_low_score": skipped_low_score,  # L1-5: visible in summary
-        # botdog-stamped prospects held out of the PB invite batch.
+        # FIX-2b: botdog-owned prospects held out of the PB invite batch.
         "botdog_excluded": botdog_excluded,
-        # Residual census: ALL rows stamped botdog, at any stage.
+        # Retirement census: ALL rows still stamped botdog, any stage.
         "botdog_stamped_total": botdog_stamped_total,
+        "sent_us_mode": 0,
     }
 
 
+def drain_connection_invites(
+    run_one: Callable[[int, int | None, set[str], set[str], set[str]], dict],
+    *,
+    batch_size: int,
+    daily_run: DailyRun,
+    us_mode_daily_cap: int | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Use sequential <=10-add containers until the daily target is met.
+
+    Each run owns its container, lease, and prelaunch Attio hold. The explicit
+    exclusion set also prevents repeat selection within this invocation if an
+    Attio list read briefly lags behind a hold write.
+    """
+    result: dict = {"sent": 0, "pb_queued": 0, "attio_updated": 0,
+                    "sent_us_mode": 0}
+    attempted_entry_ids: set[str] = set()
+    attempted_company_ids: set[str] = set()
+    attempted_urls: set[str] = set()
+    for _ in range(1 if dry_run else 5):
+        remaining_target = batch_size - result["sent"]
+        if remaining_target <= 0 or daily_run.remaining("connections") <= 0:
+            break
+        remaining_us = (
+            None if us_mode_daily_cap is None else
+            max(0, us_mode_daily_cap - result["sent_us_mode"])
+        )
+        try:
+            part = run_one(
+                remaining_target, remaining_us,
+                attempted_entry_ids, attempted_company_ids, attempted_urls,
+            )
+        except (BlankMessageError, UnresolvedPlaceholderError) as exc:
+            exc.partial_results = dict(result)
+            raise
+
+        attempted_entry_ids.update(part.get("attempted_entry_ids", []))
+        attempted_company_ids.update(part.get("attempted_company_ids", []))
+        attempted_urls.update(part.get("attempted_urls", []))
+        for key in ("sent", "pb_queued", "attio_updated", "sent_us_mode"):
+            result[key] += int(part.get(key, 0) or 0)
+        for key in ("botdog_excluded", "botdog_stamped_total"):
+            if key in part:
+                result[key] = part[key]
+        if (part.get("cancelled") or not part.get("pb_queued") or dry_run
+                or part.get("unconfirmed") or part.get("provider_restricted")):
+            break
+    return result
+
+
+@observed("dm_sequence", "phase")
 def run_dm_sequencing(
     attio: AttioClient,
     pb: PhantomBusterClient,
@@ -3464,6 +3593,7 @@ def run_dm_sequencing(
     exclude_ids: set[str] | None = None,
     metrics: Any = None,
     sender: PBSender | None = None,
+    preview_no_writes: bool = False,
 ) -> dict:
     """Part B: Send DMs to accepted connections based on timing.
 
@@ -3502,6 +3632,8 @@ def run_dm_sequencing(
 
     Returns summary dict with counts per DM step.
     """
+    if preview_no_writes and not dry_run:
+        raise ValueError("preview_no_writes requires dry_run=True")
     # Shipped-placeholder send gate (no-op on dry_run): a fresh install ships
     # neutral placeholder DM copy with a sentinel; refuse to send it live.
     assert_content_replaced(dry_run=dry_run, filenames=("messages.json",))
@@ -3522,16 +3654,17 @@ def run_dm_sequencing(
         # tomorrow only see the upstream pb_csv_empty row and have to
         # infer the downstream consequence.
         try:
-            escalate(
-                type="dm_sequencing_blocked_on_reply_failure",
-                idempotency_key=f"{run_date}|dm_sequencing",
-                payload={
-                    "run_date": run_date,
-                    "reason": "reply_detection_status=failed",
-                    "upstream_signal": "pb_csv_empty",
-                },
-                attio=attio,
-            )
+            if not preview_no_writes:
+                escalate(
+                    type="dm_sequencing_blocked_on_reply_failure",
+                    idempotency_key=f"{run_date}|dm_sequencing",
+                    payload={
+                        "run_date": run_date,
+                        "reason": "reply_detection_status=failed",
+                        "upstream_signal": "pb_csv_empty",
+                    },
+                    attio=attio,
+                )
         except (httpx.HTTPStatusError, httpx.RequestError) as q_exc:
             click.echo(
                 f"  ⚠ dm_sequencing_blocked_on_reply_failure queue write "
@@ -3548,8 +3681,9 @@ def run_dm_sequencing(
         click.echo(
             "  ⚠ Phase 0.5 reply detection FAILED — short-circuiting "
             "Part-B DM sequencing per §3.1 (would risk re-messaging a "
-            "prospect whose reply sits unread in the inbox). Opening "
-            "dm_sequencing_blocked_on_reply_failure queue row.",
+            "prospect whose reply sits unread in the inbox). "
+            + ("Preview: no queue row opened." if preview_no_writes else
+               "Opening dm_sequencing_blocked_on_reply_failure queue row."),
             err=True,
         )
         return {
@@ -3578,6 +3712,9 @@ def run_dm_sequencing(
     def _consistency_sweep_epilogue(
         results: dict, *, entries_snapshot: list[dict] | None = None
     ) -> None:
+        if preview_no_writes:
+            click.echo("  Consistency sweep deferred to the wet DM run.")
+            return
         # 2026-06-09 desync design §2 — runs on EVERY post-preflight exit
         # (incl. no-DMs-due / trimmed / cancelled): prior-day desyncs must
         # not wait for a day that happens to send DMs.
@@ -3656,7 +3793,8 @@ def run_dm_sequencing(
     # once per daily run so operators can revise the 30-day default
     # before the next run. Idempotent — `(type, decision_key,
     # idempotency_key)` uniqueness ensures only ONE row exists.
-    ensure_throttle_policy_decision_opened(attio)
+    if not preview_no_writes:
+        ensure_throttle_policy_decision_opened(attio)
 
     dm_queues: dict[MessageStep, list] = {
         MessageStep.DM1: [],
@@ -3795,19 +3933,21 @@ def run_dm_sequencing(
                 # the cadence record and inflate dm_response_rate denominators.
                 record_id = str(attrs["record_id"])
                 entry_id = str(attrs.get("entry_id", ""))
-                escalate(
-                    type="accepted_missing_last_contact_date",
-                    idempotency_key=f"accepted_no_lcd|{record_id}",
-                    payload={
-                        "record_id": record_id,
-                        "entry_id": entry_id,
-                    },
-                    attio=attio,
-                )
+                if not preview_no_writes:
+                    escalate(
+                        type="accepted_missing_last_contact_date",
+                        idempotency_key=f"accepted_no_lcd|{record_id}",
+                        payload={
+                            "record_id": record_id,
+                            "entry_id": entry_id,
+                        },
+                        attio=attio,
+                    )
                 click.echo(
                     f"  ⚠ Skipping ACCEPTED {record_id}: null last_contact_date — "
                     f"DM1 eligibility cannot be computed; "
-                    f"accepted_missing_last_contact_date queue row opened.",
+                    + ("preview: queue row deferred to the wet run." if preview_no_writes
+                       else "accepted_missing_last_contact_date queue row opened."),
                     err=True,
                 )
             continue
@@ -3848,7 +3988,10 @@ def run_dm_sequencing(
         # already populated `attio._person_to_company[record_id]`. The
         # throttle is the §3.1 second line of defense: even if THIS
         # prospect's per-person guards pass, the company may have been
-        # contacted via a sibling person within the last 30 days.
+        # DM'd via a sibling person within the 14-day window. A sibling's
+        # INVITE stamp does not block an engaged row (sibling-invite
+        # exemption, workflows.throttle) — Part A re-arming the window
+        # daily used to freeze accepted prospects at dm_step 0 forever.
         if not _check_company_throttle_or_skip(
             attrs, attio=attio, today=today, audit_logger=audit_logger,
             dry_run=dry_run,
@@ -3857,6 +4000,12 @@ def run_dm_sequencing(
             continue
 
         dm_queues[pending_dm].append(attrs)
+    # One DM thread per company per run — the exemption above lets two
+    # engaged colleagues both clear an invite-stamped company; the tally
+    # that would separate them only lands post-send.
+    queue_same_company_count = _dedupe_dm_queues_by_company(
+        dm_queues, attio=attio, cache=cache, audit_logger=audit_logger,
+    )
     record_phase_or_skip(metrics, "queue_build", _t_phase)
 
     # Loud hold-out report — fires on dry AND wet runs, and also when the
@@ -3985,6 +4134,9 @@ def run_dm_sequencing(
         "skipped_missing_language": 0,
         "skipped_language_mismatch": 0,
         "skipped_company_throttled": queue_throttled_count,
+        # Within-run §3.8 guard: a second engaged colleague at a company
+        # already queued this run (see _dedupe_dm_queues_by_company).
+        "skipped_same_company_run": queue_same_company_count,
         "skipped_missing_copy": 0,
         # Rows held out at queue build because they (or a sibling entry)
         # are stamped send_channel=botdog — no send from any transport
@@ -4008,6 +4160,12 @@ def run_dm_sequencing(
         click.echo(
             f"  Skipped {queue_throttled_count} prospect(s) for per-company "
             f"throttle (§3.8 {DEFAULT_THROTTLE_WINDOW_DAYS}-day window) — {throttle_row_note}."
+        )
+    if queue_same_company_count:
+        click.echo(
+            f"  Deferred {queue_same_company_count} DM(s) to next run — a "
+            f"colleague at the same company is already queued today (§3.8 "
+            f"one thread per company)."
         )
 
     _t_phase = phase_timer()
@@ -4198,6 +4356,12 @@ def run_dm_sequencing(
                 industry=get_industry_label(industry_raw, language),
                 language=language,
             )
+            if not dry_run:
+                guard = verify_send_preconditions(attio, str(attrs["entry_id"]), attrs["stage"])
+                if not guard.allowed:
+                    results["send_guard_skipped"] = int(results.get("send_guard_skipped", 0)) + 1
+                    click.echo(f"  [send_guard] DM skipped for {attrs['entry_id']}: {guard.reason}", err=True)
+                    continue
             rows.append({
                 "linkedInUrl": linkedin_url,
                 "message": message,
@@ -4224,18 +4388,40 @@ def run_dm_sequencing(
 
         # Pre-send guards — abort the batch if any message still contains a
         # [...] placeholder, or rendered blank (a systemic template break,
-        # not N flaky prospects). Both run before the dry-run preview and
-        # before the lease reservation; a transport's per-row validation
-        # stays as backstop. Safer to fail loudly than to ship literal
-        # tokens or empty messages.
-        _assert_no_unresolved_placeholders(rows, step.value)
-        _assert_no_blank_messages(rows, step.value)
+        # not N flaky prospects). Both run before the dry-run preview, the
+        # channel split, and either lease reservation; the transport-level
+        # per-row validation (Botdog invalid_message_text) stays as backstop.
+        try:
+            _assert_no_unresolved_placeholders(rows, step.value)
+            _assert_no_blank_messages(rows, step.value)
+        except (UnresolvedPlaceholderError, BlankMessageError) as guard_exc:
+            # The guard halts the run, but _consistency_sweep_epilogue's
+            # invariant ("runs on EVERY post-preflight exit") must survive
+            # the halt — a template that stays broken would otherwise
+            # suppress desync detection until it's fixed. Earlier steps in
+            # this loop may already have sent and advanced entries, so
+            # mirror the run-tail snapshot rule: wet runs refetch, dry runs
+            # (write-free) reuse the snapshot. The re-raise keeps the halt
+            # semantics — nothing for this step is previewed or sent.
+            if not dry_run:
+                _raw_entries_snapshot = None
+            _consistency_sweep_epilogue(
+                results, entries_snapshot=_raw_entries_snapshot
+            )
+            # Earlier steps' realized counts (dm1/dm2/dm3 advances + the
+            # botdog_* sub-dicts) ride along on the exception so cli.py's
+            # rollup can report what DID ship before the halt instead of a
+            # fabricated zero (a dm2 halt after dm1 sent N must not print
+            # "DMs sent: 0").
+            guard_exc.partial_results = results
+            raise
 
         if dry_run:
             for row in rows:
+                _wc_label = " (would claim)" if row.get("would_claim") else ""
                 click.echo(
                     f"\n  [DRY RUN] {step.value} -> {row.get('name', '?')} @ {row.get('company', '?')} "
-                    f"[stage={row.get('current_stage', '?')}]"
+                    f"[stage={row.get('current_stage', '?')}]{_wc_label}"
                 )
                 click.echo(f"    title: {row.get('title', '') or '(no title)'}")
                 click.echo(f"    url: {row['linkedInUrl']}")
@@ -4243,218 +4429,339 @@ def run_dm_sequencing(
             results["dry_run"][step.value] = len(rows)
             continue
 
-        requested_urls = {
-            _normalize_linkedin_url(row["linkedInUrl"])
-            for row in rows
-            if row.get("linkedInUrl")
-        }
-        # PR-17 B-SD-006: reserve capacity BEFORE PB is touched. The lease
-        # captures the intent ("we are about to send N"); the post-launch
-        # confirm_lease commits the actual sent_count. Drift refunds to
-        # capacity. Trim already enforced the per-step cap above, so this
-        # reservation should always succeed — a CapacityExhausted here
-        # means external state drift (a parallel process mutated the
-        # daily_run counter between trim and reserve) and must propagate.
-        lease_token: str | None = daily_run.reserve_send("messages", len(rows))
-        # PR-17 fold-in (5/6 QA convergence): try/finally spans the ENTIRE
-        # reserve → confirm region so any exception between the sheet write
-        # and confirm (PBRunFailed/PBRunTimeout from wait_for_completion,
-        # raise from download_result_csv, ValueError/KeyError from
-        # parse_send_outcome) releases the lease. Prior code only guarded
-        # pb.launch_agent — a wait_for_completion timeout (max_wait=1800)
-        # would have left the reservation permanently held for the rest of
-        # the run, silencing DM2/DM3 batches (§3.1 quota leak).
-        try:
-            # F-PR-5 advance gate feed (§3.1 chokepoint). Stage MAY advance
-            # iff csv_status == "Message sent" AND container_id matches THIS
-            # launch AND sent_count >= 1. Prior policy ("advance every
-            # queued URL on PB success") was the §3.1 violation by
-            # omission — PB silent-drops dropped from "Accepted" Attio
-            # to ghost-advance, suppressing tomorrow's re-attempt.
-            #
-            # Once the sender's wait_for_completion returns, PB ran and the
-            # DMs in this batch may have been PHYSICALLY SENT. Any raise
-            # from there on (CSV download, parse, or the confirm_lease
-            # PATCH) hits the `finally` below and REFUNDS the messages
-            # lease, leaving the cap uncharged for sends that actually went
-            # out. Mirror Part A's post-launch charge-failure echo so the
-            # abort never looks like a clean pre-send failure. PBRunFailed /
-            # PBRunTimeout are re-raised WITHOUT the echo: PB itself
-            # reported the run failed, so there is no silently-sent batch to
-            # reconcile. (The sheet write + launch now live inside the
-            # sender, so a failure there also takes the echo path — a
-            # conservative false positive, never a missed warning.)
-            pb_result = sender.launch_dm_batch(
-                rows, requested_urls, step_label=step.value
-            )
-            launch = pb_result.launch
-            outcome = pb_result.outcome
+        # Botdog retirement (2026-08-25): botdog-stamped rows never reach
+        # this point — they are held out at queue build (see
+        # botdog_channel_skipped above), so the drain loop below is
+        # pure-PB by construction.
 
-            # PR-17 B-SD-006: confirm the lease with PB-reported
-            # sent_count AS SOON AS sent_count is known. Both branches
-            # (advance-pass per-row updates + advance-fail
-            # emit_pb_silent_no_op) charge capacity by what PB actually
-            # sent. Setting lease_token=None tells finally not to
-            # release an already-consumed lease.
-            assert lease_token is not None
-            daily_run.confirm_lease(
-                lease_token, confirmed_count=outcome.sent_count
-            )
-            lease_token = None
-        except (PBRunFailed, PBRunTimeout):
-            raise
-        except Exception:
-            click.echo(
-                f"  ❌ ERROR: PB Message Sender launch for {step.value} "
-                f"completed but post-send processing FAILED (CSV download / "
-                f"parse / charging the daily_run row). The {len(rows)} DM(s) "
-                f"in this batch MAY HAVE BEEN PHYSICALLY SENT but are now "
-                f"UNCHARGED (the messages lease refunds on this abort). "
-                f"Verify today's sends in the LinkedIn inbox and reconcile the "
-                f"daily_run messages_sent counter before the next run.",
-                err=True,
-            )
-            raise
-        finally:
-            # Release the lease only if confirm_lease didn't consume it.
-            # The reserve→launch→wait→csv→parse→confirm span can raise at
-            # any point; this guarantees the reservation refunds to
-            # capacity if any step fails after the reservation.
-            if lease_token is not None:
-                daily_run.release_lease(lease_token)
-
+        # ── per-launch drain loop (2026-06-10 cap-trickle fix) ──────────
+        # PB API launches that pass `arguments` REPLACE the phantom's saved
+        # console argument wholesale (verified live 2026-06-10: the console
+        # held numberOfProfilesPerLaunch=30, yet API launches without the
+        # key processed exactly 10 rows — the phantom's built-in default).
+        # A 17-row dm1 batch therefore trickled at 10/launch: rows 11-17
+        # came back PB-unreported and waited a day for the retry.
+        # Two layers:
+        #   1. Pass numberOfProfilesPerLaunch=len(batch)+1 header line
+        #      explicitly (clients.google_sheets.profiles_per_launch) — the
+        #      same per-launch pattern the Phase-0 profile scrapers use.
+        #   2. If PB still truncates (a future phantom build renaming or
+        #      re-capping the argument), detect the truncation signature
+        #      and relaunch JUST the unprocessed tail, bounded by
+        #      MAX_DM_LAUNCHES_PER_STEP. The sheet is rewritten with only
+        #      the tail rows before each relaunch, so a row PB already
+        #      processed is never re-fed to the phantom (§3.1). Launches
+        #      stay sequential (wait_for_completion inside the loop), so
+        #      the PB workspace parallel cap is never stressed.
         next_stage = NEXT_STAGE[step]
         today_str = today.isoformat()
         updated = 0
-
-        if not should_advance_batch(launch, outcome):
-            click.echo(
-                f"  ⚠ PB Message Sender advance gate FAILED for "
-                f"{step.value} (csv_status={outcome.csv_status}, "
-                f"sent={outcome.sent_count}, "
-                f"requested={outcome.requested_count}); opening "
-                f"pb_silent_no_op queue row and skipping Attio "
-                f"updates for this batch."
-            )
-            current_experiment_id_for_dm = get_current_experiment_id()
-            emit_pb_silent_no_op(
-                launch,
-                outcome,
-                attio=attio,
-                audit_logger=audit_logger,
-                experiment_id=current_experiment_id_for_dm,
-            )
-            results.setdefault("dry_skipped", {})[step.value] = (
-                outcome.requested_count
-            )
-            continue
-
-        # Advance gate passed. Per-row advance:
-        # - PB-confirmed sent → flip stage + bump dm_step (next-day
-        #   queue won't re-pick this row)
-        # - PB-flagged-skipped (InMail-required, "Can't send") → open a
-        #   `pb_inmail_dead_end` queue row AND move the row to UNREACHABLE
-        #   (stage-only) so the sequencer stops re-queuing the same DM every
-        #   run. dm_step is deliberately NOT bumped — that would inflate
-        #   `dm_response_rate` denominators in `learn.py::_per_step_rates`
-        #   (rows with `dm_step >= n` would count as "received DM-n" even
-        #   though no message was delivered). UNREACHABLE gates the row out
-        #   of future sends; the queue row lets the operator rescue it.
-        # - PB-unreported → no state mutation, retried tomorrow.
-        current_experiment_id_for_dm = get_current_experiment_id()
+        launches_used = 0
+        step_sent_total = 0
         pb_unreported: list[str] = []
         pb_flagged_skipped: list[str] = []
         pb_park_failed: list[str] = []
-        for row in rows:
-            key = _normalize_linkedin_url(row["linkedInUrl"])
-            is_pb_sent = key in outcome.sent_urls
-            is_pb_skipped = key in outcome.skipped_urls
+        gate_failed = False
+        gate_failed_rows = 0
+        pending_rows = rows
+        while pending_rows:
+            launches_used += 1
+            requested_urls = {
+                _normalize_linkedin_url(row["linkedInUrl"])
+                for row in pending_rows
+                if row.get("linkedInUrl")
+            }
+            # PR-17 B-SD-006: reserve capacity BEFORE PB is touched. The lease
+            # captures the intent ("we are about to send N"); the post-launch
+            # confirm_lease commits the actual sent_count. Drift refunds to
+            # capacity. Trim already enforced the per-step cap above, so this
+            # reservation should always succeed — a CapacityExhausted here
+            # means external state drift (a parallel process mutated the
+            # daily_run counter between trim and reserve) and must propagate.
+            lease_token: str | None = daily_run.reserve_send(
+                "messages", len(pending_rows)
+            )
+            # PR-17 fold-in (5/6 QA convergence): try/finally spans the ENTIRE
+            # reserve → confirm region so any exception between sheet write and
+            # confirm (PBRunFailed/PBRunTimeout from wait_for_completion, raise
+            # from download_result_csv, ValueError/KeyError from
+            # parse_send_outcome) releases the lease. Prior code only guarded
+            # pb.launch_agent — a wait_for_completion timeout (max_wait=1800)
+            # would have left the reservation permanently held for the rest of
+            # the run, silencing DM2/DM3 batches (§3.1 quota leak).
+            try:
+                # Shared by daily and send-dms. Refresh on EVERY launch,
+                # including tail relaunches; failures release the lease below.
+                from workflows.dm_quality_gate import require_clear_dm_quality_queue
+                require_clear_dm_quality_queue(attio)
+                # F-PR-5 advance gate feed (§3.1 chokepoint). Stage MAY
+                # advance iff csv_status == "Message sent" AND container_id
+                # matches THIS launch AND sent_count >= 1. Prior policy
+                # ("advance every queued URL on PB success") was the §3.1
+                # violation by omission — PB silent-drops dropped from
+                # "Accepted" Attio to ghost-advance, suppressing tomorrow's
+                # re-attempt.
+                pb_result = sender.launch_dm_batch(
+                    pending_rows, requested_urls, step_label=step.value
+                )
+                launch = pb_result.launch
+                outcome = pb_result.outcome
 
-            if is_pb_skipped:
-                pb_flagged_skipped.append(row["linkedInUrl"])
-                emit_pb_inmail_dead_end(
+                # PR-17 B-SD-006: confirm the lease with the PB-confirmed
+                # count AS SOON AS it is known. Setting lease_token=None tells
+                # finally not to release an already-consumed lease.
+                # 2026-06-10 drain-loop fold-in: charge THIS launch's batch
+                # only. outcome.sent_count counts every "Message sent" CSV row,
+                # and on the agent-scoped fallback path (see
+                # download_result_csv) the file can carry rows from a PRIOR
+                # launch of this same phantom — the tail relaunch below makes
+                # that overlap likely, where the raw count would exceed the
+                # lease and trip confirm_lease's bounds check. Intersecting
+                # with requested_urls also keeps the charge equal to what the
+                # per-row advance below treats as sent (§3.1: quota consumed =
+                # sends actually executed).
+                launch_sent_count = len(requested_urls & outcome.sent_urls)
+                launch_reported_count = len(
+                    requested_urls & (outcome.sent_urls | outcome.skipped_urls)
+                )
+                assert lease_token is not None
+                try:
+                    daily_run.confirm_lease(
+                        lease_token, confirmed_count=launch_sent_count
+                    )
+                except Exception:
+                    click.echo(
+                        f"PHYSICALLY SENT {launch_sent_count} DMs, UNCHARGED: quota confirmation "
+                        "failed before CRM advancement. Reconcile provider evidence and "
+                        "the quota ledger before rerunning.",
+                        err=True,
+                    )
+                    raise
+                lease_token = None
+            finally:
+                # Release the lease only if confirm_lease didn't consume it.
+                # The reserve→launch→wait→csv→parse→confirm span can raise at
+                # any point; this guarantees the reservation refunds to
+                # capacity if any step fails after the reservation.
+                if lease_token is not None:
+                    daily_run.release_lease(lease_token)
+
+            step_sent_total += launch_sent_count
+
+            # Drain-loop fold-in (2026-06-10 review F1): ALSO fail the gate
+            # when a RELAUNCH reported ZERO of ITS OWN batch (no tail row
+            # sent OR skipped). The raw gate checks outcome.sent_count,
+            # which counts every "Message sent" CSV row — and the tail
+            # relaunch reuses the same agent + csvName, so stale rows from
+            # the PRIOR launch can nominally satisfy it while the relaunch
+            # itself no-oped. Routing that into the soft audit-only
+            # pb_url_unreported path would hide a batch-level failure;
+            # those belong to pb_silent_no_op. Scoped to launches >= 2:
+            # the first-launch zero-reported case stays on the F-PR-5 soft
+            # path (test_dm_sequencing_holds_stage_when_pb_csv_omits_
+            # prospect_url pins it), and a launch whose rows were all
+            # PB-skipped (reported > 0, sent == 0) still reaches the
+            # per-row InMail park handling below.
+            if not should_advance_batch(launch, outcome) or (
+                launches_used > 1 and launch_reported_count == 0
+            ):
+                click.echo(
+                    f"  ⚠ PB Message Sender advance gate FAILED for "
+                    f"{step.value} (csv_status={outcome.csv_status}, "
+                    f"sent={outcome.sent_count}, "
+                    f"batch-confirmed={launch_sent_count}, "
+                    f"requested={outcome.requested_count}); opening "
+                    f"pb_silent_no_op queue row and skipping Attio "
+                    f"updates for this batch."
+                )
+                current_experiment_id_for_dm = get_current_experiment_id()
+                emit_pb_silent_no_op(
                     launch,
-                    linkedin_url=key,
-                    dm_step=step.value,
-                    pb_status="skipped_in_csv",
+                    outcome,
                     attio=attio,
                     audit_logger=audit_logger,
                     experiment_id=current_experiment_id_for_dm,
                 )
-                # Wave-2-A: move the prospect to UNREACHABLE so the sequencer
-                # STOPS re-queuing this same DM every run (the Daniel/Nissan
-                # InMail-required loop). Write ONLY `stage` — NOT `dm_step` or
-                # `last_contact_date` — so the undelivered DM is never counted
-                # as "received" in learn.py::_per_step_rates denominators (the
-                # measurement guard the comment above protects). UNREACHABLE
-                # (rank 90) gates the row out of all future sends; the
-                # dead-end queue row above lets the operator rescue it.
-                # Park EVERY duplicate entry for this URL (multi-entry rows
-                # exist — the 2026-04-21 dedup history). Branch on the result
-                # like the sibling callers (pb_send_recovery, OON park): if a
-                # park write fails, AttioWriter has already DLQ'd + escalated +
-                # tallied in helper_escalate_failures, but the row stays at its
-                # DM stage and would be re-picked next run. PB re-blocks the
-                # same InMail-required DM (never delivers), so this is a wasted
-                # retry, not a duplicate send — but surface it explicitly
-                # rather than fire-and-forget.
-                park_ok = True
-                for entry_id in row.get("entry_ids") or [row.get("entry_id")]:
-                    if not entry_id:
-                        continue
-                    if not _attio_advance_with_escalation(
-                        attio=attio,
-                        entry_id=entry_id,
-                        entry_attributes={"stage": PipelineStage.UNREACHABLE.value},
-                        list_id=list_id,
-                        linkedin_url=row.get("linkedInUrl", ""),
-                        today=today_str,
-                        step_label=f"{step.value}_inmail_dead_end",
-                        writer_module="workflows.daily_check.run_dm_sequencing",
-                        prior_stage=row.get("current_stage")
-                                    or row.get("stage")
-                                    or STAGE_FOR_DM[step].value,
-                        person_record_id=row.get("record_id"),
-                        audit_logger=audit_logger,
-                        escalate_failures=helper_escalate_failures,
-                    ):
-                        park_ok = False
-                if not park_ok:
-                    pb_park_failed.append(row["linkedInUrl"])
-                continue
-            if not is_pb_sent:
-                # PB didn't confirm send for this URL. Per §3.1, do
-                # NOT advance — leave the row at its current stage
-                # so tomorrow retries.
-                pb_unreported.append(row["linkedInUrl"])
-                continue
+                # An approved provider launch failed, not an intentional skip.
+                # Keep prior confirmed sends and expose the failure to callers.
+                results.setdefault("failed_batches", []).append({
+                    "step": step.value,
+                    "container_id": launch.container_id,
+                    "requested": len(pending_rows),
+                    "confirmed_sent": launch_sent_count,
+                    "reason": "advance_gate_failed",
+                })
+                gate_failed = True
+                gate_failed_rows = len(pending_rows)
+                break
 
-            attrs_to_update = _confirmed_dm_advance_attrs(
-                step=step,
-                next_stage=next_stage,
-                today=today,
-                today_str=today_str,
-            )
-            # PR-13 (§3.15): tally Companies.last_outreach_at + 3 siblings
-            # IMMEDIATELY after the prospect advance, BEFORE the next due
-            # row's throttle check evaluates — Round-4 D32 multi-thread
-            # ABM safety requires the write to settle before sibling
-            # persons at the same company are scored for this run.
-            # 2026-06-09 desync-invariant: extracted to _finalize_confirmed_dm_send
-            # which aggregates advance outcomes and emits dm_person_advance_desync
-            # on failure while keeping the tally unconditional.
-            updated += _finalize_confirmed_dm_send(
-                attio=attio,
-                row=row,
-                step=step,
-                attrs_to_update=attrs_to_update,
-                list_id=list_id,
-                today=today,
-                today_str=today_str,
-                experiment_id=current_experiment_id_for_dm,
-                audit_logger=audit_logger,
-                escalate_failures=helper_escalate_failures,
-            )
+            # Advance gate passed. Per-row advance:
+            # - PB-confirmed sent → flip stage + bump dm_step (next-day
+            #   queue won't re-pick this row)
+            # - PB-flagged-skipped (InMail-required, "Can't send") → open a
+            #   `pb_inmail_dead_end` queue row AND move the row to UNREACHABLE
+            #   (stage-only) so the sequencer stops re-queuing the same DM every
+            #   run. dm_step is deliberately NOT bumped — that would inflate
+            #   `dm_response_rate` denominators in `learn.py::_per_step_rates`
+            #   (rows with `dm_step >= n` would count as "received DM-n" even
+            #   though no message was delivered). UNREACHABLE gates the row out
+            #   of future sends; the queue row lets the operator rescue it.
+            # - PB-unreported → no state mutation, retried tomorrow.
+            current_experiment_id_for_dm = get_current_experiment_id()
+            launch_unreported: list[str] = []
+            row_reported: list[bool] = []
+            for row in pending_rows:
+                key = _normalize_linkedin_url(row["linkedInUrl"])
+                is_pb_sent = key in outcome.sent_urls
+                is_pb_skipped = key in outcome.skipped_urls
+                row_reported.append(is_pb_sent or is_pb_skipped)
+
+                if is_pb_skipped:
+                    pb_flagged_skipped.append(row["linkedInUrl"])
+                    emit_pb_inmail_dead_end(
+                        launch,
+                        linkedin_url=key,
+                        dm_step=step.value,
+                        pb_status="skipped_in_csv",
+                        attio=attio,
+                        audit_logger=audit_logger,
+                        experiment_id=current_experiment_id_for_dm,
+                    )
+                    # Wave-2-A: move the prospect to UNREACHABLE so the sequencer
+                    # STOPS re-queuing this same DM every run (the Daniel/Nissan
+                    # InMail-required loop). Write ONLY `stage` — NOT `dm_step` or
+                    # `last_contact_date` — so the undelivered DM is never counted
+                    # as "received" in learn.py::_per_step_rates denominators (the
+                    # measurement guard the comment above protects). UNREACHABLE
+                    # (rank 90) gates the row out of all future sends; the
+                    # dead-end queue row above lets the operator rescue it.
+                    # Park EVERY duplicate entry for this URL (multi-entry rows
+                    # exist — the 2026-04-21 dedup history). Branch on the result
+                    # like the sibling callers (pb_send_recovery, OON park): if a
+                    # park write fails, AttioWriter has already DLQ'd + escalated +
+                    # tallied in helper_escalate_failures, but the row stays at its
+                    # DM stage and would be re-picked next run. PB re-blocks the
+                    # same InMail-required DM (never delivers), so this is a wasted
+                    # retry, not a duplicate send — but surface it explicitly
+                    # rather than fire-and-forget.
+                    park_ok = True
+                    for entry_id in row.get("entry_ids") or [row.get("entry_id")]:
+                        if not entry_id:
+                            continue
+                        if not _attio_advance_with_escalation(
+                            attio=attio,
+                            entry_id=entry_id,
+                            entry_attributes={"stage": PipelineStage.UNREACHABLE.value},
+                            list_id=list_id,
+                            linkedin_url=row.get("linkedInUrl", ""),
+                            today=today_str,
+                            step_label=f"{step.value}_inmail_dead_end",
+                            writer_module="workflows.daily_check.run_dm_sequencing",
+                            prior_stage=row.get("current_stage")
+                                        or row.get("stage")
+                                        or STAGE_FOR_DM[step].value,
+                            person_record_id=row.get("record_id"),
+                            audit_logger=audit_logger,
+                            escalate_failures=helper_escalate_failures,
+                        ):
+                            park_ok = False
+                    if not park_ok:
+                        pb_park_failed.append(row["linkedInUrl"])
+                    continue
+                if not is_pb_sent:
+                    # PB didn't confirm send for this URL. Per §3.1, do
+                    # NOT advance — leave the row at its current stage. The
+                    # tail-truncation check below may relaunch it this run;
+                    # otherwise tomorrow retries.
+                    launch_unreported.append(row["linkedInUrl"])
+                    continue
+
+                attrs_to_update = _confirmed_dm_advance_attrs(
+                    step=step,
+                    next_stage=next_stage,
+                    today=today,
+                    today_str=today_str,
+                )
+                # PR-13 (§3.15): tally Companies.last_outreach_at + 3 siblings
+                # IMMEDIATELY after the prospect advance, BEFORE the next due
+                # row's throttle check evaluates — Round-4 D32 multi-thread
+                # ABM safety requires the write to settle before sibling
+                # persons at the same company are scored for this run.
+                # 2026-06-09 desync-invariant: extracted to _finalize_confirmed_dm_send
+                # which aggregates advance outcomes and emits dm_person_advance_desync
+                # on failure while keeping the tally unconditional.
+                updated += _finalize_confirmed_dm_send(
+                    attio=attio,
+                    row=row,
+                    step=step,
+                    attrs_to_update=attrs_to_update,
+                    list_id=list_id,
+                    today=today,
+                    today_str=today_str,
+                    experiment_id=current_experiment_id_for_dm,
+                    audit_logger=audit_logger,
+                    escalate_failures=helper_escalate_failures,
+                )
+
+
+            # Layer-2 truncation detection: PB processed a strict prefix of
+            # the sheet and the ENTIRE remainder came back unreported — the
+            # per-launch-cap signature (a phantom stops at its row cap; it
+            # does not skip ahead). Relaunch JUST the tail with a fresh
+            # sheet write. Mid-batch reporting holes do NOT match (some
+            # later row was reported) and keep the retry-tomorrow path —
+            # a same-run relaunch must never include a row PB may have
+            # processed (§3.1).
+            # Accepted risk (2026-06-10 review F4): "unreported ⇒
+            # unprocessed" is an inference. A phantom that DID send to the
+            # first tail row but failed to write its CSV row AND exited
+            # cleanly would be re-fed here. That exposure pre-exists in the
+            # retry-tomorrow path (the row re-queues next day regardless);
+            # the relaunch narrows the window rather than adding the class,
+            # and a hard phantom crash reports status="error" → PBRunFailed
+            # → no relaunch.
+            relaunch_tail: list[dict] | None = None
+            if launch_unreported:
+                first_unreported = row_reported.index(False)
+                if first_unreported >= 1 and not any(
+                    row_reported[first_unreported:]
+                ):
+                    relaunch_tail = pending_rows[first_unreported:]
+            if (
+                relaunch_tail is not None
+                and launches_used < MAX_DM_LAUNCHES_PER_STEP
+            ):
+                click.echo(
+                    f"  ⚠ PB processed only "
+                    f"{len(pending_rows) - len(relaunch_tail)}/"
+                    f"{len(pending_rows)} {step.value} row(s) (per-launch "
+                    f"cap truncation signature) — relaunching the remaining "
+                    f"{len(relaunch_tail)} (launch {launches_used + 1}/"
+                    f"{MAX_DM_LAUNCHES_PER_STEP})."
+                )
+                if audit_logger is not None:
+                    audit_logger.event(
+                        "pb_launch_cap_truncation_relaunch",
+                        container_id=launch.container_id,
+                        dm_step=step.value,
+                        processed=len(pending_rows) - len(relaunch_tail),
+                        requested=len(pending_rows),
+                        relaunching=len(relaunch_tail),
+                        launches_used=launches_used,
+                        experiment_id=current_experiment_id_for_dm,
+                    )
+                pending_rows = relaunch_tail
+                continue
+            if relaunch_tail is not None:
+                click.echo(
+                    f"  ⚠ Cap-truncation signature persists after "
+                    f"{launches_used} launch(es) — NOT relaunching "
+                    f"(MAX_DM_LAUNCHES_PER_STEP="
+                    f"{MAX_DM_LAUNCHES_PER_STEP}); {len(relaunch_tail)} "
+                    f"row(s) fall back to the retry-tomorrow path."
+                )
+            pb_unreported.extend(launch_unreported)
+            pending_rows = []
 
         if pb_flagged_skipped:
             click.echo(
@@ -4499,39 +4806,77 @@ def run_dm_sequencing(
                         experiment_id=current_experiment_id_for_dm,
                     )
 
+        if gate_failed and launches_used == 1:
+            # Batch-level PB no-op on the FIRST launch — parity with the
+            # pre-drain-loop behavior: pb_silent_no_op queue row,
+            # nothing advanced, no per-step summary. failed_batches records
+            # the delivery failure independently of intentional skips.
+            # A gate failure on a LATER launch falls through so the rows
+            # already advanced by earlier launches stay in the summary.
+            continue
+
         # PR-17 charged the daily_run lease right after parse_send_outcome
-        # via confirm_lease(token, confirmed_count=outcome.sent_count).
+        # via confirm_lease(token, confirmed_count=launch_sent_count).
         # The legacy ``record_messages`` path was removed in PR-17 fold-in.
         #
         # L3-7: results[step.value] is the Attio-confirmed sent count
         # (rows PB confirmed AND we successfully advanced in Attio), not
         # the queue depth. A separate `{step}_queued` key carries the
         # prepared count so callers can detect send-phantom gaps.
-        # Using `updated` (Attio advances) rather than outcome.sent_count
-        # (raw PB CSV count) avoids inflating the summary when the CSV
-        # contains historic rows beyond this batch's requested_urls.
+        # Using `updated` (Attio advances) rather than the raw PB CSV
+        # sent count avoids inflating the summary when the CSV contains
+        # historic rows beyond this batch's requested_urls.
         results[step.value] = updated
         results[f"{step.value}_queued"] = len(rows)
         click.echo(
-            f"  Queued {len(rows)} {step.value} messages to PB. "
+            f"  Queued {len(rows)} {step.value} messages to PB across "
+            f"{launches_used} launch(es). "
             f"Attio advanced: {updated}/{len(rows)}. "
-            f"PB-reported sent: {outcome.sent_count}, "
+            f"PB-reported sent: {step_sent_total}, "
             f"PB-flagged skipped: {len(pb_flagged_skipped)}, "
-            f"PB-unreported: {len(pb_unreported)}."
+            f"PB-unreported: {len(pb_unreported)}"
+            # Review F2: a gate failure on a RELAUNCH leaves the remainder
+            # rows out of every count above — name them here so the one
+            # line operators read accounts for all len(rows) rows.
+            + (
+                f", gate-failed remainder (see pb_silent_no_op queue "
+                f"row): {gate_failed_rows}"
+                if gate_failed_rows
+                else ""
+            )
+            + "."
         )
 
     record_phase_or_skip(metrics, "pb_send_loop", _t_phase)
 
+    dm_guard_skipped = (
+        results.get("send_guard_owner_moved", 0)
+        + results.get("send_guard_stage_moved", 0)
+        + results.get("send_guard_reread_failed", 0)
+    )
+    if dm_guard_skipped:
+        click.echo(
+            f"  DM send-guard skipped: {dm_guard_skipped} total "
+            f"(owner_moved={results.get('send_guard_owner_moved', 0)}, "
+            f"stage_moved={results.get('send_guard_stage_moved', 0)}, "
+            f"reread_failed={results.get('send_guard_reread_failed', 0)})."
+        )
     if results["skipped_missing_language"]:
         click.echo(
             f"  Skipped {results['skipped_missing_language']} prospect(s) with "
             f"missing/invalid language — see `missing_language` Operator "
             f"Review Queue rows."
         )
+    if results["skipped_language_mismatch"]:
+        click.echo(
+            f"  Skipped {results['skipped_language_mismatch']} prospect(s) whose "
+            f"stored language disagreed with their HQ/lane-derived language — "
+            f"see `language_mismatch` Operator Review Queue rows."
+        )
     if results["language_unverified"]:
-        # Advisory rollup: per-row warnings scroll away in a long run, so
-        # this puts the total where the operator reads the summary. Mostly
-        # a dry-run concern, but NOT dry-run-only — broken overrides
+        # Task C advisory rollup: per-row warnings scroll away in a long
+        # run, so this puts the total where the operator reads the summary.
+        # Mostly a dry-run concern, but NOT dry-run-only — broken overrides
         # increment this counter on wet runs too (see
         # should_report_language_source).
         click.echo(
@@ -4550,12 +4895,6 @@ def run_dm_sequencing(
             f"`people.language` override (unreadable, or set to a language "
             f"with no copy) — those prospects may have been sent the "
             f"un-overridden language. Re-check them before the next step."
-        )
-    if results["skipped_language_mismatch"]:
-        click.echo(
-            f"  Skipped {results['skipped_language_mismatch']} prospect(s) whose "
-            f"stored language disagreed with their HQ/lane-derived language — "
-            f"see `language_mismatch` Operator Review Queue rows."
         )
     if helper_escalate_failures:
         # Wave-1.6.3: paging-level rollup of swallowed escalate() failures
@@ -4616,7 +4955,7 @@ def _classify_starvation_signal(
 
 
 def _count_degree_unknown_today(
-    crm: "CRMProvider", today: date
+    crm: CRMProvider, today: date
 ) -> int | None:
     """Count ``degree_unknown`` Operator Review Queue rows opened today.
 
@@ -4672,7 +5011,7 @@ def _count_degree_unknown_today(
 
 
 def run_end_summary(
-    crm: "CRMProvider",
+    crm: CRMProvider,
     daily_run: DailyRun,
     *,
     prospect_pool_size: int,
@@ -4773,7 +5112,7 @@ def run_end_summary(
 
 
 def compute_due_dm_counts(
-    crm: "CRMProvider",
+    crm: CRMProvider,
     cache: RecordCache | None = None,
     today: date | None = None,
 ) -> dict[str, int]:
@@ -5035,3 +5374,9 @@ def check_responses_manual(attio: AttioClient) -> None:
                         f"manually if needed.",
                         err=True,
                     )
+
+
+INVITE_UNCONFIRMED_HOLD_UNTIL = "2099-12-31"
+
+
+MAX_DM_LAUNCHES_PER_STEP = 3

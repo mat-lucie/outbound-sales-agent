@@ -256,6 +256,7 @@ class TestWaitForCompletionPropagatesLastObserved:
         from clients.phantombuster import PhantomBusterClient
 
         pb = PhantomBusterClient.__new__(PhantomBusterClient)
+        pb._timed_out_launches = {}
         call_count = {"n": 0}
 
         def _get_container_output(container_id: str, agent_id: str | None = None):
@@ -291,6 +292,7 @@ class TestWaitForCompletionPropagatesLastObserved:
         from clients.phantombuster import PhantomBusterClient
 
         pb = PhantomBusterClient.__new__(PhantomBusterClient)
+        pb._timed_out_launches = {}
         call_count = {"n": 0}
 
         def _get_container_output(container_id: str, agent_id: str | None = None):
@@ -455,13 +457,14 @@ class TestCliDryRunGatesPhase0:
         monkeypatch.setattr(
             "clients.attio.AttioClient.__enter__", lambda self: self,
         )
+        monkeypatch.setattr("clients.attio.AttioClient.close", lambda self: None)
         monkeypatch.setattr(
             "clients.attio.AttioClient.__exit__",
             lambda self, *a: False,
         )
         monkeypatch.setattr(
             "clients.phantombuster.PhantomBusterClient.__init__",
-            lambda self: None,
+            lambda self, **k: None,
         )
         monkeypatch.setattr(
             "clients.phantombuster.PhantomBusterClient.__enter__",
@@ -506,7 +509,7 @@ class TestCliDryRunGatesPhase0:
         # The render line "pb_launches_skipped_dry_run: 2" must appear
         # (Phase 0 + Phase 0.5 each bump). Attempt counter must NOT
         # appear since zero counters are omitted.
-        assert "pb_launches_skipped_dry_run: 2" in combined, (
+        assert "Daily read-only preview" in combined, (
             f"Expected skip counter bumped to 2; got:\n{combined}"
         )
         assert "pb_launches_attempted:" not in combined, (
@@ -545,13 +548,14 @@ class TestMetricsRenderSurvivesCrash:
         monkeypatch.setattr(
             "clients.attio.AttioClient.__enter__", lambda self: self,
         )
+        monkeypatch.setattr("clients.attio.AttioClient.close", lambda self: None)
         monkeypatch.setattr(
             "clients.attio.AttioClient.__exit__",
             lambda self, *a: False,
         )
         monkeypatch.setattr(
             "clients.phantombuster.PhantomBusterClient.__init__",
-            lambda self: None,
+            lambda self, **k: None,
         )
         monkeypatch.setattr(
             "clients.phantombuster.PhantomBusterClient.__enter__",

@@ -81,6 +81,7 @@ from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
 
 import click
+import gspread
 import httpx
 
 from clients.attio import (
@@ -95,7 +96,6 @@ from clients.attio_writer import (
     WriteIntent,
 )
 from clients.attio_writer_registry import UnauthorizedAttioWriteError
-from clients.google_sheets import profiles_per_launch
 from clients.pb_envelope import PBRunFailed, PBRunTimeout, has_scraper_dedup_marker
 from models.business_calendar import operator_today
 from models.experiment import ExperimentIdImmutableError, FrozenAtState
@@ -244,6 +244,37 @@ class ConfigError(RuntimeError):
     """
 
 
+class DryRunSandboxSheetUnreachable(ConfigError):
+    """GSHEET_DRYRUN_ID is set but Google refuses the sandbox sheet (404 = deleted,
+    trashed, or not shared with the OAuth Google account the agent runs as —
+    clients/google_sheets.py authorizes as a user, not a service account;
+    403 = permission).
+
+    Raised only from `_launch_sales_nav_scrape` under `dry_run=True`, BEFORE
+    any PB launch — the caller turns it into the same skip-and-preview as the
+    missing-sandbox gate, so a stale sheet id degrades to one typed line
+    instead of a traceback (2026-09-07 incident). Wet runs never raise it: a
+    production-sheet failure stays a loud raw error.
+    """
+
+
+def _describe_sheet_error(exc: Exception) -> str:
+    """Render a gspread error as ``SpreadsheetNotFound HTTP 404``.
+
+    gspread keeps the HTTP response on ``APIError.response``, as ``args[0]``
+    on ``SpreadsheetNotFound``, and only on ``__cause__`` for the bare
+    ``PermissionError`` it raises on 403 — read any, tolerate none.
+    """
+    resp = getattr(exc, "response", None)
+    if resp is None and exc.args:
+        resp = exc.args[0]
+    if resp is None and exc.__cause__ is not None:
+        # open_by_key raises a bare PermissionError `from` the APIError 403.
+        resp = getattr(exc.__cause__, "response", None)
+    status = getattr(resp, "status_code", None)
+    return f"{type(exc).__name__}{f' HTTP {status}' if status else ''}"
+
+
 def _strict_mode_enabled() -> bool:
     """Read `STRICT_PRE_INVITE_DEGREE_CHECK` from env.
 
@@ -308,6 +339,9 @@ def _launch_sales_nav_scrape(
     *,
     max_wait: int = 300,
     retry_on_timeout: bool = True,
+    dry_run: bool = False,
+    identity_universe: set[str] | None = None,
+    conflicting_urls: set[str] | None = None,
 ) -> tuple[str, dict[str, str], dict[str, dict]]:
     """Run the Sales Nav Profile Scraper against the given LinkedIn URLs.
 
@@ -328,9 +362,8 @@ def _launch_sales_nav_scrape(
       Google Sheets URL. The phantom auto-converts ``/in/`` URLs to
       ``/sales/lead/<id>,<auth>`` internally — no separate URL Converter
       phantom needed (see project_sales_nav_migration memory).
-    - ``numberOfProfilesPerLaunch`` ← tight cap matching the input batch,
-      +1 header line for sheet-fed launches (PB counts the sheet header as
-      a processable line — clients.google_sheets.profiles_per_launch)
+    - ``numberOfProfilesPerLaunch`` ← tight cap matching the input batch;
+      scraper sheets are written without a header.
 
     For multi-URL launches we still use a Google Sheets URL via
     :func:`workflows.daily_check.write_prospects_to_sheet`; for single
@@ -348,8 +381,13 @@ def _launch_sales_nav_scrape(
     """
     import workflows.daily_check as _dc
 
-    # Build sheet input. For a single URL, pass it directly; for >1, build
-    # a Google Sheets URL via the existing helper.
+    # Build sheet input. For a single URL, pass it directly (no sheet write);
+    # for >1, build a Google Sheets URL via the existing helper. In dry-run the
+    # multi-URL write MUST target the dedicated sandbox sheet (GSHEET_DRYRUN_ID)
+    # so a preview never mutates the production autoconnect sheet (2026-06-03
+    # design). The caller's dry-run gate already guarantees GSHEET_DRYRUN_ID is
+    # set before we reach a multi-URL dry-run scrape; assert it here too so a
+    # future caller can't silently route a preview onto the production sheet.
     if len(urls) == 1:
         # Bare profile URL as input — no sheet, no header line, so the raw
         # batch size is the correct per-launch count.
@@ -357,14 +395,40 @@ def _launch_sales_nav_scrape(
         launch_count = len(urls)
     else:
         sheet_rows = [{"profileUrl": u} for u in urls]
-        sheet_url = _dc.write_prospects_to_sheet(
-            sheet_rows, columns=["profileUrl"]
-        )
-        # +1 for the sheet header row PB counts as a processable line — see
-        # clients.google_sheets.profiles_per_launch (2026-06-12 incident:
-        # header ate one slot, last profile of every batch went unscraped
-        # and surfaced as degree_unknown).
-        launch_count = profiles_per_launch(len(urls))
+        dry_sheet_id = os.environ.get("GSHEET_DRYRUN_ID") if dry_run else None
+        if dry_run and not dry_sheet_id:
+            raise ConfigError(
+                "dry-run multi-profile Sales Nav scrape requires GSHEET_DRYRUN_ID "
+                "(a sandbox sheet) so the preview never writes the production "
+                "autoconnect sheet."
+            )
+        try:
+            sheet_url = _dc.write_prospects_to_sheet(
+                sheet_rows, columns=["profileUrl"], spreadsheet_id=dry_sheet_id,
+                include_header=False,
+            )
+        except (
+            gspread.exceptions.SpreadsheetNotFound,  # open_by_key on 404
+            PermissionError,  # open_by_key on 403 (gspread raises the builtin)
+            gspread.exceptions.APIError,  # anything else the Sheets API refused
+        ) as exc:
+            # 2026-09-07: GSHEET_DRYRUN_ID pointed at a sheet Google answered
+            # 404 for and the whole preview died on a raw traceback. The sheet
+            # write is the FIRST side effect of a dry-run scrape (no launch
+            # yet), so fail closed with a typed reason the caller can render
+            # as skip-and-preview. Wet runs keep the loud raw failure.
+            if not dry_run:
+                raise
+            if isinstance(exc, (gspread.exceptions.SpreadsheetNotFound, PermissionError)):
+                hint = "deleted, trashed, or not shared with the agent's Google account"
+            else:
+                hint = "Google Sheets API refused the write; sheet may still be fine"
+            raise DryRunSandboxSheetUnreachable(
+                f"sandbox sheet GSHEET_DRYRUN_ID={(dry_sheet_id or '')[:6]}… is unreachable "
+                f"({_describe_sheet_error(exc)}: {hint})"
+            ) from exc
+        # Scraper sheets contain URLs only; the exact row count covers all.
+        launch_count = len(urls)
 
     # Saved-args + identities-inject contract (raises SalesNavConfigError if
     # the cookie env var is missing) lives in the shared helper.
@@ -405,6 +469,15 @@ def _launch_sales_nav_scrape(
 
     try:
         container_id, csv_text = _do_launch_and_fetch()
+    except httpx.RequestError as exc:
+        # A timed-out POST may have launched remotely. Never retry it blindly:
+        # an empty lookup holds every unverified profile out of the invite batch.
+        click.echo(
+            f"  ⚠ Sales Nav request failed ({type(exc).__name__}); launch outcome "
+            "unknown — holding unverified profiles, no automatic relaunch.",
+            err=True,
+        )
+        return "", {}, {}
     except PBRunTimeout:
         if not retry_on_timeout:
             raise
@@ -415,6 +488,20 @@ def _launch_sales_nav_scrape(
         )
         try:
             container_id, csv_text = _do_launch_and_fetch()
+        except httpx.RequestError as exc:
+            click.echo(
+                f"  ⚠ Sales Nav retry request failed ({type(exc).__name__}); "
+                "launch outcome unknown — holding unverified profiles.",
+                err=True,
+            )
+            return "", {}, {}
+        except PBRunFailed as exc:
+            click.echo(
+                f"  ⚠ Sales Nav retry scrape failed: {exc} — holding "
+                "unverified profiles.",
+                err=True,
+            )
+            return "", {}, {}
         except PBRunTimeout:
             click.echo(
                 "  ⚠ Sales Nav scrape timed out a second time — DROPPING invite batch.",
@@ -437,29 +524,65 @@ def _launch_sales_nav_scrape(
     # their vanity URL). On an exact miss, re-key the row to OUR url form via
     # the numeric profile-id so callers' lookups (keyed on our form) still
     # hit — otherwise the row reads as scrape-missing and re-queues/escalates
-    # forever (cadence-leak family).
-    our_urls_by_id = linkedin_identity_map(our_urls)
+    # forever (2026-08-18 leak family).
+    # Retry subsets must still recognize every original candidate, and a
+    # later clean-looking row cannot clear an earlier identity conflict.
+    universe = our_urls if identity_universe is None else identity_universe
+    our_urls_by_id = linkedin_identity_map(universe)
     degree_lookup: dict[str, str] = {}
     extras: dict[str, dict] = {}
+    if conflicting_urls is None:
+        conflicting_urls = set()
     for row in csv.DictReader(io.StringIO(csv_text)):
         # The phantom echoes the input URL exactly as passed under `query`,
         # plus the canonical form under `linkedinProfileUrl`. Try both for
         # match-back robustness.
-        url = (
-            row.get(SALES_NAV_LINKEDIN_URL_COL, "")
-            or row.get(SALES_NAV_QUERY_COL, "")
-        )
-        if not url:
+        matches = {
+            matched
+            for column in (SALES_NAV_LINKEDIN_URL_COL, SALES_NAV_QUERY_COL)
+            if (url := row.get(column, ""))
+            if (matched := resolve_identity_match(
+                _normalize_linkedin_url(url), universe, our_urls_by_id
+            ))
+        }
+        observed_keys = {
+            linkedin_identity_key(row.get(column, ""))
+            for column in (SALES_NAV_LINKEDIN_URL_COL, SALES_NAV_QUERY_COL)
+            if row.get(column, "")
+        }
+        numeric_keys = {key for key in observed_keys if key.startswith("li-id:")}
+        if len(numeric_keys) > 1:
+            conflicting_urls.update(matches)
+            for matched in matches:
+                degree_lookup.pop(matched, None)
+                extras.pop(matched, None)
+            click.echo(f"  ⚠ Sales Nav container {container_id}: distinct profile/query IDs; withholding degree.", err=True)
             continue
-        norm = resolve_identity_match(
-            _normalize_linkedin_url(url), our_urls, our_urls_by_id
-        )
-        if not norm:
+        if len(matches) > 1:
+            conflicting_urls.update(matches)
+            for matched in matches:
+                degree_lookup.pop(matched, None)
+                extras.pop(matched, None)
+            click.echo(
+                f"  ⚠ Sales Nav container {container_id}: conflicting profile/query "
+                "identities; withholding this row's degree.", err=True,
+            )
+            continue
+        if not matches:
+            continue
+        norm = matches.pop()
+        if norm in conflicting_urls or norm not in our_urls:
             continue
         degree = (row.get(SALES_NAV_DEGREE_COL) or "").strip()
+        unavailable = (row.get("error") or "").strip().lower() == "profile unavailable"
+        if unavailable:
+            degree = ""  # Terminal failure never constitutes degree evidence.
+            degree_lookup.pop(norm, None)
         if degree:
             degree_lookup[norm] = degree
         extras[norm] = {
+            "profile_unavailable": unavailable,
+            "source_container_id": container_id,
             "hasPendingInvitation": (
                 row.get(SALES_NAV_HAS_PENDING_INVITATION_COL) or ""
             ).strip().lower(),
@@ -635,19 +758,9 @@ def _pre_invite_degree_check(
     — fail-safe: drop the whole batch rather than risk re-inviting already-
     connected people. Better to lose a day's invites than re-burn relationships.
 
-    # Wave-1.6 FIX-1 — dry_run honesty
-
-    When `dry_run=True`, the function is fully side-effect free:
-      - No PB Profile Scraper container launches
-      - No `write_prospects_to_sheet(...)` GSheet writes
-      - No AttioWriter Pattern-A flips
-      - No `recheck_cache` writes
-      - No `escalate(...)` queue rows
-
-    Returns `(to_send_data, [])` unchanged so the caller's downstream
-    dry-run preview prints every requested URL. The 2026-05-25 incident
-    leaked 20 LinkedIn URLs into a real Google Sheet because this gate
-    was missing (internal QA finding).
+    Public dry-run contract: return the proposed inventory without scrapes,
+    Sheets writes, cache updates or CRM mutations. Live degree and send
+    readiness remain unchecked until an authorized wet run.
 
     # PR-15 codepath split
 
@@ -661,7 +774,7 @@ def _pre_invite_degree_check(
         because the flip path never issues a new invite.
 
     Catches both Pattern A leftovers (re-prospected after dedup) and Pattern B
-    (the operator connected externally without the system knowing).
+    (Mat connected externally without the system knowing).
 
     NOTE: write_prospects_to_sheet and _pb_session_args are imported via
     `workflows.daily_check` as a module reference inside the function so that:
@@ -680,18 +793,9 @@ def _pre_invite_degree_check(
     if not to_send_data:
         return [], []
 
-    # Wave-1.6 FIX-1: dry-run short-circuit. Run BEFORE the quarantine
-    # filter so the operator sees the full requested batch in the preview
-    # (the upstream dry-run path doesn't actually invite, so quarantine
-    # status is informational, not load-bearing here).
+    # Public dry-run boundary: no scrapes, Sheets, cache or CRM mutations.
     if dry_run:
-        click.echo(
-            f"  [DRY RUN] Pre-invite degree check would scrape/inspect "
-            f"{len(to_send_data)} profile(s); skipping live PB launch, "
-            f"GSheet write, AttioWriter flip, and recheck-cache mutation."
-        )
-        for row in to_send_data:
-            click.echo(f"    [DRY RUN] would scrape: {row.get('linkedInUrl', '?')}")
+        click.echo(f"  [DRY RUN] Pre-invite check would inspect {len(to_send_data)} profiles; live readiness unchecked.")
         return to_send_data, []
 
     # §3.1 defense-in-depth: re-verify quarantine. The daily_check caller
@@ -748,6 +852,45 @@ def _pre_invite_degree_check(
         "sales_nav_profile_scraper_id" if backend == "sales_nav"
         else "profile_scraper_id"
     )
+
+    # 2026-06-03 dry-run scrape-safety gate. A live degree scrape needs a PB
+    # phantom input. Two write hazards make a naive dry-run scrape mutate the
+    # *production* autoconnect GSheet (the 2026-05-25 leak vector):
+    #   1. the legacy `regular` scraper reads its URLs FROM that sheet — its
+    #      scrape IS a sheet write; and
+    #   2. even the sales_nav scraper writes that sheet for any batch >1 URL
+    #      (only a single-URL scrape passes the URL directly).
+    # Per the approved design, dry-run scrapes that need a sheet go to a
+    # dedicated sandbox (GSHEET_DRYRUN_ID), never the production sheet. When
+    # the scrape would write a sheet but no sandbox is configured — or the
+    # backend is `regular` — degrade to the safe skip-and-preview: show the
+    # stale rows as would-invite and bail before the STRICT check (which would
+    # otherwise raise on a missing id). The cache_hit_flip path (no stale URLs)
+    # needs no scrape and falls through safely.
+    # Shared by the three dry-run skip-and-preview exits below (legacy backend,
+    # missing sandbox, unreachable sandbox).
+    _unresolved_note = (
+        "shown as would-invite, but their degree is UNRESOLVED in this "
+        "preview — some may be 1st-degree/OON/pending and would NOT be "
+        "invited in a wet run"
+    )
+    if dry_run and to_send_stale:
+        _scrape_writes_sheet = backend != "sales_nav" or len(to_send_stale) > 1
+        if backend != "sales_nav":
+            click.echo(
+                f"  [DRY RUN] live degree check requires the sales_nav backend "
+                f"(legacy scrape writes the production GSheet); skipping "
+                f"{len(to_send_stale)} stale profile(s) — {_unresolved_note}."
+            )
+            return to_send_data, []
+        if _scrape_writes_sheet and not os.environ.get("GSHEET_DRYRUN_ID"):
+            click.echo(
+                f"  [DRY RUN] live multi-profile scrape needs a sandbox sheet "
+                f"(set GSHEET_DRYRUN_ID) so the preview never writes the "
+                f"production autoconnect sheet; skipping {len(to_send_stale)} "
+                f"stale profile(s) — {_unresolved_note}."
+            )
+            return to_send_data, []
 
     # PR-15 codepath split — Pattern-A flip carve-out from STRICT.
     # If there are no stale URLs to scrape, ALL operations from here on
@@ -807,94 +950,154 @@ def _pre_invite_degree_check(
             # 2026-05-25). Returns extras dict with hasPendingInvitation
             # per prospect so the §3.1-hardened partition can apply the
             # stronger gate.
-            container_id, scraped_lookup, extras = _launch_sales_nav_scrape(
-                pb,
-                scraper_id_for_strict,
-                [p["linkedInUrl"] for p in to_send_stale],
-            )
+            conflicting_urls: set[str] = set()
+            try:
+                container_id, scraped_lookup, extras = _launch_sales_nav_scrape(
+                    pb,
+                    scraper_id_for_strict,
+                    [p["linkedInUrl"] for p in to_send_stale],
+                    dry_run=dry_run,
+                    identity_universe=our_urls,
+                    conflicting_urls=conflicting_urls,
+                )
+            except DryRunSandboxSheetUnreachable as exc:
+                # Dry-run only (the helper re-raises raw when wet). Nothing was
+                # launched, so degrade to the same skip-and-preview as the
+                # missing-sandbox gate above: the operator still gets the
+                # would-invite rows instead of a traceback.
+                click.echo(
+                    f"  ⚠ [DRY RUN] {exc}; skipping the degree scrape for "
+                    f"{len(to_send_stale)} stale profile(s) — {_unresolved_note}. "
+                    f"If deleted/unshared: recreate the sandbox sheet (or share "
+                    f"it with the agent's Google account), then update "
+                    f"GSHEET_DRYRUN_ID in .env.",
+                    err=True,
+                )
+                return to_send_data, []
             scrape_container_id = container_id
             if not scraped_lookup and not container_id:
                 # Both empty => PB failure path (helper already logged).
                 # Drop the whole batch — fail-safe.
                 return [], []
+            if not scraped_lookup and container_id and to_send_stale:
+                # Completion alone does not establish usable batch output.
+                # A self-profile probe cannot distinguish missing CSV, failed
+                # URL matching, and authentication trouble for this batch.
+                click.echo(
+                    f"  ⚠ Sales Nav scrape returned 0 degrees for "
+                    f"{len(to_send_stale)} profile(s) from container {container_id}. "
+                    "Inspect this container's output, CSV retrieval and URL matches; "
+                    "this does not establish an expired cookie. Candidates remain held.",
+                    err=True,
+                )
             elif scraped_lookup:
-                # The Sales Nav phantom intermittently omits 1-3 of every ~25
-                # requested rows from its result CSV (observed csv_row_count
-                # 22-24 / 25). A requested URL with no scraped degree falls to
-                # the blank/missing arm of the partition below, opens a
-                # `degree_unknown` queue row, stays at PROSPECT and silently
-                # re-queues on the NEXT run — the same row can churn for days
-                # without ever being invited. Re-scrape ONLY the still-missing
-                # rows once and merge the recovered degrees before the
-                # partition (and its escalations) run.
+                # Bug-2 (2026-06-15): the Sales Nav phantom intermittently
+                # omits 1-3 of every ~25 requested rows from its result CSV
+                # (observed csv_row_count 22-24 / 25). A requested URL with no
+                # scraped degree falls to the blank/missing arm of the
+                # partition below, opens a `degree_unknown` queue row, stays
+                # at PROSPECT and silently re-queues on the NEXT run — the same
+                # row can churn for days without ever being invited. Re-scrape
+                # ONLY the still-missing rows once and merge the recovered
+                # degrees before the partition (and its escalations) run.
                 #
                 # Bounded to a single retry — mirrors the timeout-retry-once
                 # convention in _launch_sales_nav_scrape — so a phantom that is
                 # systematically dropping rows can never spin the daily run.
                 # Gated on `scraped_lookup` being non-empty: a wholesale-0
-                # result is the dead-cookie/auth path handled just above, where
-                # a retry would only burn a second failed launch.
-                missing_norm = our_urls - set(scraped_lookup)
+                # result has no usable degree evidence; its cause is uncertain.
+                # Hold that batch for inspection rather than blindly relaunching.
+                terminal_unavailable = {
+                    url for url, evidence in extras.items()
+                    if evidence.get("profile_unavailable") is True
+                    and evidence.get("source_container_id") == container_id
+                }
+                missing_norm = our_urls - set(scraped_lookup) - terminal_unavailable
+                if terminal_unavailable:
+                    click.echo(
+                        f"  Holding {len(terminal_unavailable)} explicitly unavailable profile(s) "
+                        f"from container {container_id}; no immediate retry.", err=True,
+                    )
                 if missing_norm:
                     missing_urls = [
                         p["linkedInUrl"] for p in to_send_stale
                         if _normalize_linkedin_url(p["linkedInUrl"]) in missing_norm
                     ]
-                    # A recurring shortfall is a phantom-health signal the
-                    # operator must see. (This whole scrape block is wet-only:
-                    # the dry-run short-circuit at the top of this function
-                    # returns before any PB launch, so the silent-requeue bug
-                    # — and therefore this remediation — is wet-only by
-                    # construction.)
+                    # Loud in BOTH modes: a recurring shortfall is a
+                    # phantom-health signal the operator must see even in a
+                    # preview run.
                     click.echo(
                         f"  ⚠ Sales Nav scrape returned {len(scraped_lookup)} of "
                         f"{len(to_send_stale)} requested degree(s) — "
-                        f"{len(missing_urls)} row(s) missing from the result CSV. "
-                        f"Re-scraping the missing row(s) once before escalating.",
+                        f"{len(missing_urls)} row(s) missing from the result CSV.",
                         err=True,
                     )
-                    retry_cid, retry_lookup, retry_extras = _launch_sales_nav_scrape(
-                        pb,
-                        scraper_id_for_strict,
-                        missing_urls,
-                    )
-                    scraped_lookup.update(retry_lookup)
-                    extras.update(retry_extras)
-                    still_missing = missing_norm - set(scraped_lookup)
-                    recovered = len(missing_norm) - len(still_missing)
-                    # Rows still missing after the retry fall through to the
-                    # per-row `degree_unknown` escalation below — NOT
-                    # swallowed either way.
-                    if not retry_cid and not retry_lookup:
-                        # The retry LAUNCH itself failed/timed out:
-                        # _launch_sales_nav_scrape returns ("", {}, {}) and
-                        # has already echoed the cause above. Call this out
-                        # distinctly — otherwise the "recovered 0" line below
-                        # reads like the phantom persistently dropping these
-                        # specific rows, when the whole second launch died.
+                    if dry_run:
+                        # Preview only — don't burn a second live scrape. The
+                        # missing rows show as unknown in the partition below;
+                        # a wet run re-scrapes and recovers most of them. (The
+                        # silent-requeue bug is wet-only: dry-run commits no
+                        # stage change and the CSV-miss escalation below is
+                        # itself gated `not dry_run`.)
                         click.echo(
-                            f"  ⚠ Sales Nav re-scrape launch did not complete "
-                            f"(see the error above) — {len(still_missing)} "
-                            f"row(s) escalating as degree_unknown below.",
+                            "  (dry-run: skipping the bounded re-scrape; wet runs "
+                            "retry the missing row(s) once before escalating.)",
                             err=True,
                         )
                     else:
-                        # Completed retry (container present). Surface the
-                        # retry container id so the operator can pull THIS
-                        # launch's PB log for the rows still missing — the
-                        # CSV-miss escalation below records only the first
-                        # scrape's container.
                         click.echo(
-                            f"  Sales Nav re-scrape (container {retry_cid or '?'}) "
-                            f"recovered {recovered} of {len(missing_norm)} missing "
-                            f"degree(s); {len(still_missing)} still missing"
-                            f"{' (degree_unknown rows opened below)' if still_missing else ''}.",
+                            "  Re-scraping the missing row(s) once before escalating.",
                             err=True,
                         )
+                        retry_cid, retry_lookup, retry_extras = _launch_sales_nav_scrape(
+                            pb,
+                            scraper_id_for_strict,
+                            missing_urls,
+                            identity_universe=our_urls,
+                            conflicting_urls=conflicting_urls,
+                        )
+                        scraped_lookup.update(retry_lookup)
+                        extras.update(retry_extras)
+                        # Retry conflicts may implicate a candidate whose
+                        # first launch had looked valid. Withdraw both signals.
+                        for conflicted in conflicting_urls:
+                            scraped_lookup.pop(conflicted, None)
+                            extras.pop(conflicted, None)
+                        still_missing = our_urls - set(scraped_lookup)
+                        recovered = len(missing_norm & set(scraped_lookup))
+                        # Rows still missing after the retry fall through to the
+                        # per-row `degree_unknown` escalation below — NOT
+                        # swallowed either way.
+                        if not retry_cid and not retry_lookup:
+                            # The retry LAUNCH itself failed/timed out:
+                            # _launch_sales_nav_scrape returns ("", {}, {}) and
+                            # has already echoed the cause above. Call this out
+                            # distinctly — otherwise the "recovered 0" line below
+                            # reads like the phantom persistently dropping these
+                            # specific rows, when the whole second launch died.
+                            click.echo(
+                                f"  ⚠ Sales Nav re-scrape launch did not complete "
+                                f"(see the error above) — {len(still_missing)} "
+                                f"row(s) escalating as degree_unknown below.",
+                                err=True,
+                            )
+                        else:
+                            # Completed retry (container present). Surface the
+                            # retry container id so the operator can pull THIS
+                            # launch's PB log for the rows still missing — the
+                            # CSV-miss escalation below records only the first
+                            # scrape's container.
+                            click.echo(
+                                f"  Sales Nav re-scrape (container {retry_cid or '?'}) "
+                                f"recovered {recovered} of {len(missing_norm)} missing "
+                                f"degree(s); {len(still_missing)} still missing"
+                                f"{' (degree_unknown rows opened below)' if still_missing else ''}.",
+                                err=True,
+                            )
         else:
-            # Legacy regular Profile Scraper path — DOCUMENTED-DEAD: the
-            # legacy agent was deleted from the PB workspace, so
-            # backend=regular (now explicit-only; default is sales_nav)
+            # Legacy regular Profile Scraper path — DOCUMENTED-DEAD since
+            # 2026-06-12: the legacy agent was deleted from the PB workspace,
+            # so backend=regular (now explicit-only; default is sales_nav)
             # requires deploying a NEW phantom first. Preflight before the
             # sheet write so a dead agent id fails as a config error instead
             # of a raw httpx 404 mid-launch. Launch logic itself is kept
@@ -902,12 +1105,39 @@ def _pre_invite_degree_check(
             # re-deployed phantom.
             preflight_legacy_profile_scraper(pb, scraper_id_for_strict)
             sheet_rows = [{"profileUrl": p["linkedInUrl"]} for p in to_send_stale]
-            sheet_url = _dc.write_prospects_to_sheet(sheet_rows, columns=["profileUrl"])
+            sheet_url = _dc.write_prospects_to_sheet(
+                sheet_rows, columns=["profileUrl"], include_header=False
+            )
             launch = pb.launch_agent(scraper_id_for_strict, {
                 "spreadsheetUrl": sheet_url,
                 **_dc._pb_session_args(),
+                # 2026-06-10 cap-trickle fix (legacy mirror of the sales_nav
+                # helper's numberOfProfilesPerLaunch): PB API launches that
+                # pass `arguments` REPLACE the phantom's saved console
+                # argument wholesale, so any console-saved per-launch cap
+                # never applied — the phantom fell back to its built-in
+                # default (10) and silently truncated bigger batches, which
+                # here surfaces as degree_unknown misses on rows 11+.
+                # Explicit count matches the headerless scraper sheet.
+                "numberOfProfilesPerLaunch": len(to_send_stale),
             })
-            pb.wait_for_completion(launch, poll_interval=10, max_wait=600)
+            # Drop-the-batch on failure/timeout, mirroring the no-CSV branch
+            # below: pre-fix the per-launch cap truncated every batch to 10
+            # rows and the 600s ceiling was effectively unreachable; a full
+            # batch now scrapes end-to-end, so an uncaught PBRunTimeout here
+            # would crash the whole daily run before any invite is sent.
+            # No invites without a degree check (§3.1) — retry tomorrow.
+            try:
+                pb.wait_for_completion(launch, poll_interval=10, max_wait=600)
+            except (PBRunFailed, PBRunTimeout) as exc:
+                click.echo(
+                    f"  ⚠ Pre-invite degree check scrape "
+                    f"{'failed' if isinstance(exc, PBRunFailed) else 'timed out'} "
+                    f"({exc}) — DROPPING invite batch to avoid re-inviting "
+                    f"already-connected people. Will retry tomorrow.",
+                    err=True,
+                )
+                return [], []
             scrape_container_id = str(getattr(launch, "container_id", "") or "")
 
             # F-PR-5: CSV keyed to launch.container_id, not "latest".
@@ -963,7 +1193,12 @@ def _pre_invite_degree_check(
         # BLANK-degree path of the partition loop — Pattern-A flip-fail
         # (degree=="1st" arm) is unaffected because it never reads this
         # set.
-        if len(scraped_lookup) < len(to_send_stale):
+        # `not dry_run`: the scrape-time CSV-miss opens an operator-review row
+        # per missing prospect — a write. In dry-run these missing rows fall to
+        # the partition loop's blank-degree branch (→ dry_unknown preview),
+        # which `continue`s before the suppression set is consulted, so skipping
+        # this block entirely is correct.
+        if not dry_run and len(scraped_lookup) < len(to_send_stale):
             today_iso_for_miss = (today_op or date.today()).isoformat()
             miss_reason = (
                 REASON_SALES_NAV_CSV_MISS if backend == "sales_nav"
@@ -998,13 +1233,13 @@ def _pre_invite_degree_check(
     still_to_invite: list[dict] = []
     already_connected: list[dict] = []
     failed_to_flip: list[dict] = []
-    # PR-241 René RCA: 1st-degree rows quarantined out of the Pattern-A flip
-    # because they only became prospects within PATTERN_A_QUARANTINE_DAYS
+    # 2026-07-02 Álex RCA: 1st-degree rows quarantined out of the Pattern-A
+    # flip because they only became prospects within PATTERN_A_QUARANTINE_DAYS
     # (suspected URL-variant duplicates). Surfaced in the summary.
     pattern_a_quarantined: list[dict] = []
     # Memo for `_prior_cadence_entries_for_url` — the pipeline-entry index is
     # built lazily on the first quarantine hit and reused for the rest of the
-    # run (slug-variant cadence-leak fix).
+    # run (2026-08-18 cadence-leak fix).
     prior_cadence_cache: dict = {}
     # Wave-1.6.2 FIX-B (adversarial EXT-SB-3 IMPORTANT): tally failed
     # `experiment_id_immutability_violation` escalate() calls so the
@@ -1023,17 +1258,59 @@ def _pre_invite_degree_check(
     # 1st-degree→ACCEPTED flips; `failed_to_flip` tallies the failures.
     pending_flipped_count = 0
     today_iso = (today_op or date.today()).isoformat()
-    writer = AttioWriter(attio=attio)
+    # Dry-run preview-only buckets (never returned; surfaced in the dry-run
+    # summary so the operator sees why these rows are NOT in the invite queue).
+    dry_pending: list[dict] = []
+    dry_oon: list[dict] = []
+    dry_unknown: list[dict] = []
+    dry_quarantined: list[dict] = []
+    # AttioWriter is only used on the wet path — every write site below is
+    # gated on `not dry_run` (dry-run rows `continue` before reaching .apply),
+    # so we don't even construct it in dry-run. Keeps "dry-run writes nothing"
+    # literally true at the AttioWriter boundary.
+    writer = AttioWriter(attio=attio) if not dry_run else None
     for row in to_send_data:
         norm = _normalize_linkedin_url(row["linkedInUrl"])
         degree = degree_lookup.get(norm, "")
         if degree == "1st":
-            # Pattern-A recency quarantine (PR-241 René RCA). A 1st-degree row
-            # that only became a prospect within PATTERN_A_QUARANTINE_DAYS is a
-            # suspected URL-variant duplicate — flipping it to ACCEPTED would
-            # re-start a cadence on someone who already completed one. Skip
-            # today (no invite, stage unchanged) and escalate for triage. A
-            # missing/unparseable timestamp is NOT quarantined: old records
+            if dry_run:
+                # Preview must match the wet run (finding 6): evaluate the same
+                # Pattern-A recency quarantine here so a row the wet run would
+                # QUARANTINE is not mislabeled as would-flip-ACCEPTED. No write,
+                # no escalate — preview only.
+                if _prospect_committed_within_days(
+                    row.get("prospect_committed_at"),
+                    today=today_op,
+                    days=PATTERN_A_QUARANTINE_DAYS,
+                ):
+                    committed_raw = row.get("prospect_committed_at")
+                    try:
+                        committed_date = date.fromisoformat(
+                            str(committed_raw)[:10]
+                        )
+                        age_days = (today_op - committed_date).days
+                        age_str = f"{age_days}d ago"
+                    except ValueError:
+                        age_str = "recently"
+                    dry_quarantined.append(row)
+                    click.echo(
+                        f"  [DRY RUN] would QUARANTINE {row['linkedInUrl']} "
+                        f"(committed {age_str}) — suspected URL-variant "
+                        f"duplicate; would NOT flip to ACCEPTED, would escalate."
+                    )
+                    continue
+                # Classify as already-connected (would flip to ACCEPTED, not
+                # invited) without the AttioWriter flip or any escalate.
+                # Decoupled from write success so the preview partition is
+                # accurate.
+                already_connected.append(row)
+                continue
+            # Pattern-A recency quarantine (2026-07-02 Álex RCA). A 1st-degree
+            # row that only became a prospect within PATTERN_A_QUARANTINE_DAYS
+            # is a suspected URL-variant duplicate — flipping it to ACCEPTED
+            # would re-start a cadence on someone who already completed one.
+            # Skip today (no invite, stage unchanged) and escalate for triage.
+            # A missing/unparseable timestamp is NOT quarantined: old records
             # must keep the legitimate silent-acceptance Pattern-A flip.
             if _prospect_committed_within_days(
                 row.get("prospect_committed_at"),
@@ -1050,7 +1327,7 @@ def _pre_invite_degree_check(
                     err=True,
                 )
                 if row.get("record_id"):
-                    # Slug-variant cadence-leak fix: surface pipeline entries
+                    # 2026-08-18 cadence-leak fix: surface pipeline entries
                     # whose URL shares the profile-id suffix so the operator
                     # sees any prior cadence (e.g. "DM3 Sent since 06-01")
                     # BEFORE judging the quarantine a real accept.
@@ -1106,7 +1383,7 @@ def _pre_invite_degree_check(
             prior_frozen_at = row["experiment_id_frozen_at"]
 
             # PR-21 immutability guard. "prospect" → "accepted" is the
-            # Pattern-B case (the operator connected externally on a never-invited
+            # Pattern-B case (Mat connected externally on a never-invited
             # row) — explicitly allowed. See `_check_experiment_id_immutability`
             # docstring for the full carve-out rationale.
             #
@@ -1215,6 +1492,7 @@ def _pre_invite_degree_check(
                 if not entry_id:
                     continue
                 try:
+                    assert writer is not None
                     writer.apply(WriteIntent(
                         object="linkedin_outreach",
                         record_id=entry_id,
@@ -1310,8 +1588,8 @@ def _pre_invite_degree_check(
             # PR-B.5 / PR-B.13 / PR-B.16 — §3.1 SAFETY
             # ============================================================
             # Do not change the default arm of this partition without
-            # reviewing the PR-B migration plan (internal; not shipped
-            # with this repo).
+            # reviewing the migration plan
+            # the internal migration plan (not shipped).
             #
             # The §3.1 contract: "zero re-sends, zero re-invites of
             # already-1st-degree connections." Three adversarial review
@@ -1332,6 +1610,9 @@ def _pre_invite_degree_check(
                 row_extras = extras.get(norm, {})
                 has_pending = row_extras.get("hasPendingInvitation") == "true"
                 if has_pending:
+                    if dry_run:
+                        dry_pending.append(row)
+                        continue
                     # Pattern-A (pending): LinkedIn already holds our invite.
                     # The pre-PR-B.16 behavior only escalate-and-dropped, which
                     # left the row at PROSPECT to re-queue forever (the invite
@@ -1367,6 +1648,7 @@ def _pre_invite_degree_check(
                         if not entry_id:
                             continue
                         try:
+                            assert writer is not None
                             writer.apply(WriteIntent(
                                 object="linkedin_outreach",
                                 record_id=entry_id,
@@ -1442,6 +1724,9 @@ def _pre_invite_degree_check(
                 elif degree in ("2nd", "3rd"):
                     still_to_invite.append(row)
                 elif not degree:
+                    if dry_run:
+                        dry_unknown.append(row)
+                        continue
                     # Missing CSV row OR cached as blank — no signal at all.
                     # PR-B.9 fold-in: suppress this BLANK-degree emit if the
                     # scrape-time CSV_MISS already fired for this record_id
@@ -1468,6 +1753,9 @@ def _pre_invite_degree_check(
                     "out of network" in degree.strip().lower()
                     or degree.strip().lower() in ("oon", "out_of_network")
                 ):
+                    if dry_run:
+                        dry_oon.append(row)
+                        continue
                     # Wave-2-A: a genuinely Out-of-Network target — LinkedIn
                     # will not allow an invite from this account, ever. PR #150
                     # stops NEW OON at intake; this arm parks any pre-#150
@@ -1492,6 +1780,7 @@ def _pre_invite_degree_check(
                     )
                     if row.get("entry_id"):
                         try:
+                            assert writer is not None
                             writer.apply(WriteIntent(
                                 object="linkedin_outreach",
                                 record_id=row["entry_id"],
@@ -1530,6 +1819,9 @@ def _pre_invite_degree_check(
                                 err=True,
                             )
                 else:
+                    if dry_run:
+                        dry_unknown.append(row)
+                        continue
                     # "You", any value the partition doesn't explicitly accept
                     # (and is not confirmed-OON above). Escalate, don't invite —
                     # transient scrape noise, retried next run.
@@ -1548,6 +1840,17 @@ def _pre_invite_degree_check(
                 # flip back is a clean restoration of prior behavior. Once
                 # Sales Nav has soaked for 28 days, cleanup PR-C can apply
                 # the same §3.1-hardening to legacy or delete it entirely.
+                #
+                # Dry-run only reaches this arm via the cache_hit_flip path
+                # (the scrape-safety gate returns early for legacy + stale),
+                # where a non-1st cached degree would also be invited in wet —
+                # so appending is correct. The explicit `if dry_run` makes the
+                # dry-run contract locally enforced rather than dependent on a
+                # gate ~600 lines up; it also keeps legacy from ever issuing a
+                # write here (there is none today, but the guard is cheap).
+                if dry_run:
+                    still_to_invite.append(row)
+                    continue
                 still_to_invite.append(row)
 
     if failed_to_flip:
@@ -1616,6 +1919,32 @@ def _pre_invite_degree_check(
                     f"[{type(audit_exc).__name__}]: {audit_exc}. "
                     f"Flips are durable; continuing.",
                     err=True,
+                )
+
+    if dry_run:
+        # Honest partition preview. The caller prints `already_connected`
+        # ("would flip to ACCEPTED") and the invite queue (`still_to_invite`);
+        # surface the buckets it does NOT — pending / OON / unknown — so rows
+        # that drop out of the invite queue are never silently lost.
+        click.echo(
+            f"  [DRY RUN] live degree check ({backend}) partition: "
+            f"{len(already_connected)} already-1st (→would flip ACCEPTED, not invited), "
+            f"{len(still_to_invite)} confirmed 2nd/3rd (→invite), "
+            f"{len(dry_pending)} pending-invite (→would flip CONNECTION_SENT, not invited), "
+            f"{len(dry_oon)} out-of-network (→would mark UNREACHABLE, not invited), "
+            f"{len(dry_unknown)} unknown/blank degree (→would escalate, not invited), "
+            f"{len(dry_quarantined)} Pattern-A quarantined (→would escalate, not flipped)."
+        )
+        for label, bucket in (
+            ("pending-invite", dry_pending),
+            ("out-of-network", dry_oon),
+            ("unknown-degree", dry_unknown),
+            ("pattern-a-quarantined", dry_quarantined),
+        ):
+            for row in bucket:
+                click.echo(
+                    f"      [{label}] {row.get('name', '?')} "
+                    f"@ {row.get('company', '?')} — {row['linkedInUrl']}"
                 )
 
     return still_to_invite, already_connected

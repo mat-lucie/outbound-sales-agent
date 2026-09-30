@@ -60,6 +60,31 @@ def test_set_snooze_and_callback_serialize_dates():
     assert _intent(writer2).updates == {"followup_callback_date": "2026-09-15"}
 
 
+def test_clear_callback_builds_null_intent():
+    writer = MagicMock()
+    followup_state.clear_callback(writer, object="deals", record_id="d1")
+    intent = _intent(writer)
+    assert intent.object == "deals"
+    assert intent.is_list_entry is False
+    assert intent.updates == {"followup_callback_date": None}
+    assert intent.writer_module == "workflows.followup_state"
+
+
+def test_clear_callback_list_path_requires_and_carries_list_id():
+    writer = MagicMock()
+    with pytest.raises(ValueError):
+        followup_state.clear_callback(writer, object="linkedin_outreach", record_id="ent-1")
+
+    writer2 = MagicMock()
+    followup_state.clear_callback(
+        writer2, object="linkedin_outreach", record_id="ent-1", list_id="L-9"
+    )
+    intent = _intent(writer2)
+    assert intent.is_list_entry is True
+    assert intent.list_id == "L-9"
+    assert intent.updates == {"followup_callback_date": None}
+
+
 # ── stamp_referred_by ──────────────────────────────────────────────────────
 
 
@@ -186,6 +211,73 @@ def test_cli_snooze_rejects_absurd_date(monkeypatch):
     )
     assert result.exit_code == 1
     assert "typo" in result.output
+
+
+def test_cli_followup_callback_set_ok(monkeypatch):
+    from click.testing import CliRunner
+
+    from cli import cli
+
+    monkeypatch.setattr("clients.attio_writer.AttioWriter", MagicMock)
+    result = CliRunner().invoke(
+        cli, ["followup-callback", "--object", "deals", "--id", "d1", "--date", "2026-09-15"]
+    )
+    assert result.exit_code == 0
+    assert "ok: set_callback deals:d1" in result.output
+
+
+def test_cli_followup_callback_set_rejects_absurd_date(monkeypatch):
+    from click.testing import CliRunner
+
+    from cli import cli
+
+    # --date optional now (for --clear) — the horizon guard must still fire.
+    monkeypatch.setattr("clients.attio_writer.AttioWriter", MagicMock)
+    result = CliRunner().invoke(
+        cli, ["followup-callback", "--object", "deals", "--id", "d1", "--date", "2099-01-01"]
+    )
+    assert result.exit_code == 1
+    assert "typo" in result.output
+
+
+def test_cli_followup_callback_clear(monkeypatch):
+    from click.testing import CliRunner
+
+    from cli import cli
+
+    monkeypatch.setattr("clients.attio_writer.AttioWriter", MagicMock)
+    result = CliRunner().invoke(cli, ["followup-callback", "--object", "deals", "--id", "d1", "--clear"])
+    assert result.exit_code == 0
+    assert "ok: clear_callback deals:d1" in result.output
+
+
+def test_cli_followup_callback_requires_exactly_one_of_date_or_clear(monkeypatch):
+    from click.testing import CliRunner
+
+    from cli import cli
+
+    monkeypatch.setattr("clients.attio_writer.AttioWriter", MagicMock)
+    for args in (
+        ["followup-callback", "--object", "deals", "--id", "d1"],  # neither
+        ["followup-callback", "--object", "deals", "--id", "d1", "--date", "2026-09-15", "--clear"],  # both
+    ):
+        result = CliRunner().invoke(cli, args)
+        assert result.exit_code == 1
+        assert "exactly one" in result.output
+
+
+def test_cli_followup_callback_clear_linkedin_requires_list_id(monkeypatch):
+    from click.testing import CliRunner
+
+    from cli import cli
+
+    monkeypatch.setattr("clients.attio_writer.AttioWriter", MagicMock)
+    monkeypatch.delenv("ATTIO_LIST_ID", raising=False)
+    result = CliRunner().invoke(
+        cli, ["followup-callback", "--object", "linkedin_outreach", "--id", "ent-1", "--clear"]
+    )
+    assert result.exit_code == 1
+    assert "ATTIO_LIST_ID" in result.output
 
 
 def test_cli_followup_stamp_linkedin_requires_list_id(monkeypatch):

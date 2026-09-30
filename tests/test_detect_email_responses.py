@@ -14,6 +14,7 @@ import pytest
 from models.email_campaign import ACTIVE_STAGES, EmailStage
 from workflows.detect_email_responses import (
     MAX_RESPONSE_TEXT_LEN,
+    _reconstruct_opener,
     detect_email_responses,
 )
 
@@ -307,3 +308,44 @@ def test_gmail_search_error_skips_prospect_not_run():
         counts = detect_email_responses(attio, gmail)
     assert counts["gmail_errors"] == 1
     assert counts["detected"] == 1
+
+
+# ── Blank opener guard ──────────────────────────────────────────────
+
+
+@pytest.fixture()
+def _fresh_opener_cache():
+    """Isolate _reconstruct_opener's lru_cache from other tests."""
+    _reconstruct_opener.cache_clear()
+    yield
+    _reconstruct_opener.cache_clear()
+
+
+def test_blank_rendered_opener_warns_on_stderr(_fresh_opener_cache, capsys):
+    with patch(
+        "workflows.detect_email_responses.get_email_template",
+        return_value={"subject": "", "body_html": "<p>   </p>"},
+    ):
+        _reconstruct_opener("en")
+    err = capsys.readouterr().err
+    assert "blank" in err
+    assert "'en'" in err
+    assert "content/emails.json" in err
+
+
+def test_template_missing_keys_warns_on_stderr(_fresh_opener_cache, capsys):
+    with patch(
+        "workflows.detect_email_responses.get_email_template",
+        return_value={},
+    ):
+        _reconstruct_opener("es")
+    err = capsys.readouterr().err
+    assert "blank" in err
+    assert "'es'" in err
+
+
+def test_healthy_opener_no_warning(_fresh_opener_cache, capsys):
+    opener = _reconstruct_opener("en")
+    assert "Subject:" in opener
+    assert len(opener) > 50
+    assert capsys.readouterr().err == ""

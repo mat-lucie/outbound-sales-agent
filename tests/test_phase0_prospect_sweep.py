@@ -113,7 +113,8 @@ def _run_phase0(entries, pb, monkeypatch, *, backend="sales_nav", last_checked_b
     )
     sheet_calls: list[list[dict]] = []
 
-    def _capture_sheet(rows, columns=None):
+    def _capture_sheet(rows, columns=None, include_header=True):
+        assert include_header is False
         sheet_calls.append(rows)
         return "https://s"
 

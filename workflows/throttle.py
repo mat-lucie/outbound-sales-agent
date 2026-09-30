@@ -105,17 +105,33 @@ def company_throttle_permits(
     prospect's next DM step for the full window, structurally killing
     the 5-8 day DM2/DM3 cadence.
 
-    Fail-closed branches (all block): no person stamp (legacy rows),
-    malformed stamp shapes, unreadable step (emits
-    `malformed_company_last_outreach_person_stamp`), and the desync
-    case — stamp step ahead of the person's dm_step, the signature of a
-    person-side advance that failed after a confirmed send (emits
-    `company_throttle_desync_blocked`; exempting it would re-send the
-    same DM). A firing exemption emits `company_throttle_self_exempt`
-    with step context (§0 #9). Callers must only thread
-    `person_record_id` for engaged (post-PROSPECT) candidates — a
-    PROSPECT with a self-stamp is corrupted state and must stay
-    quarantined.
+    Sibling-invite exemption (2026-09-02): when `person_record_id` is
+    provided (an engaged candidate) and the blocking stamp is an
+    invite-class step (`CONNECTION_SENT`) — to a colleague, or a
+    legacy stamp with no readable person — the block is waived and
+    `company_throttle_sibling_invite_exempt` is emitted. An invite to
+    colleague B creates no same-message risk against a DM to A, whose
+    connection already exists and whose own dm_step/last_contact_date
+    guards pace the cadence. Without this, Part A re-arming the window
+    every time it invited another person at the company froze accepted
+    prospects at dm_step 0 indefinitely (2026-09-01/02: nine Accepted
+    rows never received DM1). A sibling DM-class stamp (DM1/DM2/DM3)
+    still blocks — that is the §3.8 one-thread-per-company rule
+    ("never send the same message to two people at the same company").
+
+    Fail-closed branches (all block): no person stamp with a DM-class
+    or unreadable step (legacy rows), malformed stamp shapes,
+    unreadable or unknown step (emits
+    `malformed_company_last_outreach_person_stamp` with a `reason`),
+    and the desync case — self-stamp step ahead of the person's
+    dm_step, the signature of a person-side advance that failed after
+    a confirmed send (emits `company_throttle_desync_blocked`;
+    exempting it would re-send the same DM). A firing self-exemption
+    emits `company_throttle_self_exempt` with step context (§0 #9).
+    Callers must only thread `person_record_id` for engaged
+    (post-PROSPECT) candidates — a PROSPECT with a self-stamp is
+    corrupted state and must stay quarantined, and the invite path must
+    keep throttling invites against invites.
 
     Permissive defaults:
       - `company_id is None` (prospect has no linked company) → True.
@@ -206,18 +222,22 @@ def company_throttle_permits(
         stamped_person = (
             first.get("target_record_id") if isinstance(first, dict) else None
         )
+        stamped_step = _extract_step_title(values.get("last_outreach_step"))
         if stamped_person and stamped_person == person_record_id:
-            stamped_step = _extract_step_title(values.get("last_outreach_step"))
             if stamped_step is None:
                 # Present-but-unreadable stamp: cannot verify consistency.
                 # Block, and make it observable (§0 #9) so a re-frozen
                 # cadence is distinguishable from a sibling block.
                 if audit_logger is not None:
+                    # Same kwarg shape as the sibling branch below so one
+                    # consumer can read every emission of this event.
                     audit_logger.event(
                         "malformed_company_last_outreach_person_stamp",
                         company_id=company_id,
                         person_record_id=person_record_id,
                         reason="unreadable_step",
+                        stamped_person=stamped_person,
+                        stamped_step="",
                     )
                 return False
             required_dm_step = _SELF_EXEMPT_REQUIRED_DM_STEP.get(stamped_step)
@@ -245,6 +265,37 @@ def company_throttle_permits(
                 )
             return True
 
+        # Sibling-invite exemption: the stamp that would block us is an
+        # INVITE to someone else at the company (Part A keeps inviting
+        # colleagues, re-arming the window). Invites throttle invites;
+        # they must not freeze a DM to a prospect who already accepted —
+        # the connection exists and their own cadence guards pace it. A
+        # sibling DM-class stamp keeps blocking (one DM thread per
+        # company per window). Unreadable / unknown step → fail closed,
+        # loudly (§0 #9), so a frozen cadence is never a silent mystery.
+        if stamped_step is None or stamped_step not in _KNOWN_STAMP_STEPS:
+            if audit_logger is not None:
+                audit_logger.event(
+                    "malformed_company_last_outreach_person_stamp",
+                    company_id=company_id,
+                    person_record_id=person_record_id,
+                    reason="unreadable_step" if stamped_step is None else "unknown_step",
+                    stamped_person=stamped_person or "",
+                    stamped_step=stamped_step or "",
+                )
+            return False
+        if stamped_step in _INVITE_CLASS_STAMP_STEPS:
+            if audit_logger is not None:
+                audit_logger.event(
+                    "company_throttle_sibling_invite_exempt",
+                    company_id=company_id,
+                    person_record_id=person_record_id,
+                    stamped_person=stamped_person or "",
+                    stamped_step=stamped_step,
+                    person_dm_step=person_dm_step or 0,
+                )
+            return True
+
     return False
 
 
@@ -258,6 +309,13 @@ _SELF_EXEMPT_REQUIRED_DM_STEP = {
     "DM2": 2,
     "DM3": 3,
 }
+
+# `companies.last_outreach_step` select options (docs/attio_schema_deltas.yaml,
+# written only by `_write_company_throttle_tally`). Invite-class stamps never
+# block an engaged candidate's DM (sibling-invite exemption); DM-class stamps
+# from a sibling do. Anything outside the union is corrupt → fail closed.
+_INVITE_CLASS_STAMP_STEPS = frozenset({"CONNECTION_SENT"})
+_KNOWN_STAMP_STEPS = _INVITE_CLASS_STAMP_STEPS | frozenset(_SELF_EXEMPT_REQUIRED_DM_STEP)
 
 
 def _extract_step_title(raw: object) -> str | None:

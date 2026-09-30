@@ -129,6 +129,7 @@ def recover_unrecorded_dm_sends(
     today: str,
     *,
     dry_run: bool = False,
+    expected_container_id: str | None = None,
 ) -> dict:
     """Reconcile the last Message Sender run's result.csv against Attio.
 
@@ -169,11 +170,20 @@ def recover_unrecorded_dm_sends(
         "skipped_failed": 0,
         "skipped_no_transition": 0,
         "skipped_write_failed": 0,
+        "skipped_wrong_run": 0,
     }
 
     # ── Step 1: fetch last PB run output ─────────────────────────────────
     out = pb.get_output(message_sender_id)
     output_text = out.get("output", "") or ""
+    if expected_container_id is not None:
+        observed_container = out.get("containerId")
+        if observed_container != expected_container_id:
+            print(f"[pb_send_recovery] containerId={observed_container!r} does not match expected {expected_container_id!r}; skipping recovery", file=sys.stderr)
+            summary["skipped_wrong_run"] = -1
+            return summary
+    else:
+        print("[pb_send_recovery] WARN: no expected_container_id provided; cannot verify run attribution", file=sys.stderr)
     csv_url = _parse_csv_url_from_output(output_text)
     if not csv_url:
         print(

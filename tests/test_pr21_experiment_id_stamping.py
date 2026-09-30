@@ -1007,7 +1007,7 @@ class TestInviteSuccessFrozenAtStamp:
         completion = PBCompletion(
             container_id="c-inv",
             status="finished",
-            log_output="",
+            log_output="Invitation sent to test-invite",
             raw_output={"status": "finished", "output": ""},
         )
         pb.launch_agent.return_value = launch
@@ -1471,3 +1471,12 @@ class TestFixBPatternAImmutabilityNoOrphan:
         assert len(already) == 2, (
             f"expected both rows in already_connected; got {len(already)}"
         )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_state_boundary():
+    from unittest.mock import patch
+
+    from workflows.email_send_guard import GuardResult
+    with patch("workflows.daily_check.verify_send_preconditions", return_value=GuardResult(True)), patch("workflows.email_campaign.verify_email_send_preconditions", return_value=GuardResult(True)), patch("workflows.dm_quality_gate.require_clear_dm_quality_queue"):
+        yield

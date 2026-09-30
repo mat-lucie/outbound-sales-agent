@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from clients.pb_envelope import PBRunFailed, PBRunTimeout
@@ -834,9 +835,8 @@ class TestSalesNavLaunchArgShape:
         self, _pb_args, _sheet,
     ):
         """The phantom uses numberOfProfilesPerLaunch as a tight cap;
-        the launch helper sets it to len(urls) + 1 header line (PB counts
-        the sheet header as a processable line, 2026-06-12 last-row-dropped
-        incident) — not the saved phantom default."""
+        the launch helper sets it to len(urls) for the headerless sheet,
+        not the saved phantom default."""
         attio = MagicMock()
         pb = _make_pb(csv_text=_sales_nav_csv([
             {"url": "https://www.linkedin.com/in/alice", "degree": "2nd"},
@@ -851,7 +851,8 @@ class TestSalesNavLaunchArgShape:
         )
 
         launch_args = pb.launch_agent.call_args.args[1]
-        assert launch_args["numberOfProfilesPerLaunch"] == 4
+        assert launch_args["numberOfProfilesPerLaunch"] == 3
+        assert _sheet.call_args.kwargs["include_header"] is False
 
 
 # ----------------------------------------------------------------------
@@ -1009,6 +1010,77 @@ class TestSalesNavDuplicateEntryHealing:
         )
 
 
+def test_explicit_unavailable_row_is_provenanced_without_degree():
+    from workflows.pre_invite_check import _launch_sales_nav_scrape
+    url = "https://linkedin.com/in/alice"
+    pb = _make_pb(
+        "query,linkedinProfileUrl,connectionDegree,error\n"
+        + f"{url},{url},,profile unavailable\n"
+    )
+    cid, degrees, extras = _launch_sales_nav_scrape(pb, SALES_NAV_SCRAPER_ID, [url])
+    assert degrees == {}
+    assert extras[url]["profile_unavailable"] is True
+    assert extras[url]["source_container_id"] == cid == "container-SN-1"
+
+
+def test_unrequested_profile_identity_cannot_supply_requested_degree():
+    from workflows.pre_invite_check import _launch_sales_nav_scrape
+    requested = "https://linkedin.com/in/requested-123456"
+    other = "https://linkedin.com/in/unrequested-654321"
+    pb = _make_pb("query,linkedinProfileUrl,connectionDegree,hasPendingInvitation\n"
+                  f"{requested},{other},2nd,false\n")
+    conflicts = set()
+    _, degrees, extras = _launch_sales_nav_scrape(
+        pb, SALES_NAV_SCRAPER_ID, [requested], conflicting_urls=conflicts
+    )
+    assert requested not in degrees
+    assert requested not in extras
+    assert requested in conflicts
+
+
+def test_later_clean_row_cannot_erase_identity_conflict():
+    from workflows.pre_invite_check import _launch_sales_nav_scrape
+    requested = "https://linkedin.com/in/requested-123456"
+    other = "https://linkedin.com/in/unrequested-654321"
+    pb = _make_pb("query,linkedinProfileUrl,connectionDegree,hasPendingInvitation\n"
+                  f"{requested},{other},2nd,false\n"
+                  f"{requested},{requested},2nd,false\n")
+    conflicts = set()
+    _, degrees, extras = _launch_sales_nav_scrape(
+        pb, SALES_NAV_SCRAPER_ID, [requested], conflicting_urls=conflicts
+    )
+    assert not degrees
+    assert not extras
+    pb.download_result_csv.return_value = (
+        "query,linkedinProfileUrl,connectionDegree,hasPendingInvitation\n"
+        f"{requested},{requested},2nd,false\n"
+    )
+    _, degrees, extras = _launch_sales_nav_scrape(
+        pb, SALES_NAV_SCRAPER_ID, [requested], conflicting_urls=conflicts
+    )
+    assert not degrees
+    assert not extras
+
+
+@patch("workflows.daily_check.write_prospects_to_sheet", return_value="https://sheet.example/foo")
+@patch("workflows.daily_check._pb_session_args", return_value={})
+def test_unavailable_profile_is_held_without_retry(_args, _sheet, monkeypatch):
+    _record_escalate(monkeypatch)
+    pb = _make_pb(
+        "query,linkedinProfileUrl,connectionDegree,error\n"
+        "https://www.linkedin.com/in/alice,https://www.linkedin.com/in/alice,2nd,\n"
+        "https://www.linkedin.com/in/bob,https://www.linkedin.com/in/bob,,profile unavailable\n"
+    )
+    with patch("workflows.recheck_cache.record_many"):
+        still, already = _pre_invite_degree_check(
+            [_row("A"), _row("B")], pb, None, MagicMock(), "list-id",
+            sales_nav_profile_scraper_id=SALES_NAV_SCRAPER_ID,
+        )
+    assert pb.launch_agent.call_count == 1
+    assert [row["entry_id"] for row in still] == ["ent-A"]
+    assert already == []
+
+
 # ----------------------------------------------------------------------
 # Bounded re-scrape of rows the SN phantom drops
 # ----------------------------------------------------------------------
@@ -1020,6 +1092,42 @@ class TestSalesNavDroppedRowRetry:
     """The SN phantom intermittently omits rows from its result CSV. A wet
     run must re-scrape the missing rows ONCE and recover them rather than
     silently routing them to degree_unknown + a PROSPECT re-queue."""
+
+    def test_initial_http_timeout_holds_entire_batch(
+        self, _pb_args, _sheet, monkeypatch: pytest.MonkeyPatch, capsys,
+    ):
+        escalations = _record_escalate(monkeypatch)
+        pb = _make_pb()
+        pb.launch_agent.side_effect = httpx.ReadTimeout("timeout")
+        with patch("workflows.recheck_cache.record_many"):
+            still, already = _pre_invite_degree_check(
+                [_row("A"), _row("B")], pb, None, MagicMock(), "list-id",
+                sales_nav_profile_scraper_id=SALES_NAV_SCRAPER_ID,
+            )
+        assert still == already == []
+        assert pb.launch_agent.call_count == 1
+        assert escalations == []  # whole-batch launch failure is held, not per-row CSV miss
+        assert "no automatic relaunch" in capsys.readouterr().err
+
+    def test_retry_http_timeout_holds_missing_profile(
+        self, _pb_args, _sheet, monkeypatch: pytest.MonkeyPatch, capsys,
+    ):
+        escalations = _record_escalate(monkeypatch)
+        pb = _make_pb(csv_text=_sales_nav_csv([
+            {"url": "https://www.linkedin.com/in/alice", "degree": "2nd"},
+            {"url": "https://www.linkedin.com/in/bob", "degree": "2nd"},
+        ]))
+        pb.launch_agent.side_effect = [pb.launch_agent.return_value, httpx.ReadTimeout("timeout")]
+        with patch("workflows.recheck_cache.record_many"):
+            still, _ = _pre_invite_degree_check(
+                [_row("A"), _row("B"), _row("C")], pb, None, MagicMock(), "list-id",
+                sales_nav_profile_scraper_id=SALES_NAV_SCRAPER_ID,
+            )
+        assert {r["entry_id"] for r in still} == {"ent-A", "ent-B"}
+        assert pb.launch_agent.call_count == 2
+        assert [c["payload"]["failure_reason"] for c in escalations
+                if c["payload"].get("record_id") == "rec-C"] == [REASON_SALES_NAV_CSV_MISS]
+        assert "launch outcome unknown" in capsys.readouterr().err
 
     def test_wet_rescrapes_dropped_row_and_recovers_it(
         self, _pb_args, _sheet, monkeypatch: pytest.MonkeyPatch,

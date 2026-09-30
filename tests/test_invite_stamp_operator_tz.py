@@ -71,7 +71,7 @@ def test_invite_advance_stamps_operator_today_not_utc():
     pb.wait_for_completion.return_value = PBCompletion(
         container_id="c-gate",
         status="finished",
-        log_output=_MARKER,
+        log_output="Invitation sent to invite-target",
         raw_output={"status": "finished", "output": _MARKER},
     )
     pb.download_result_csv.return_value = ""
@@ -84,6 +84,8 @@ def test_invite_advance_stamps_operator_today_not_utc():
     attio = MagicMock()
     attio.is_person_company_corrupted.return_value = False
     attio.query_list_entries.return_value = entries
+    from tests.fakes import stub_guard_reread
+    stub_guard_reread(attio, entries)
 
     def _cache_get(record_id):
         return ("Inv Person", "Acme", invite_url, "", "Plant Manager")
@@ -111,7 +113,7 @@ def test_invite_advance_stamps_operator_today_not_utc():
          patch("workflows.daily_check._pre_invite_degree_check", side_effect=_passthrough_pic), \
          patch("workflows.daily_check.write_prospects_to_sheet",
                return_value="https://docs.google.com/spreadsheets/d/fake"), \
-         patch("workflows.daily_check._advance_already_processed_rows", advance_spy), \
+         patch("workflows.daily_check._attio_advance_with_escalation", advance_spy), \
          patch("workflows.daily_check.emit_pb_silent_no_op"), \
          patch("workflows.daily_check.recheck_cache") as mock_rc:
         mock_rc.partition.side_effect = lambda urls: ({}, list(urls))
@@ -122,7 +124,7 @@ def test_invite_advance_stamps_operator_today_not_utc():
             daily_run=fake_daily_run(),
         )
 
-    assert advance_spy.called, "invites-only already-processed batch should advance"
+    assert advance_spy.called, "invites-only confirmed invitation should advance"
     stamped_today = advance_spy.call_args.kwargs["today"]
     assert stamped_today == operator_day.isoformat(), (
         f"post-send stamp must use the operator-local date "

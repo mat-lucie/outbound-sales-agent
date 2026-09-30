@@ -33,6 +33,7 @@ def _patch_clients_and_lock(monkeypatch):
     disable the run lock. The CRM factory builds an AttioProvider over the
     stubbed AttioClient, so _crm_provider() yields a working provider with no
     creds and no network."""
+    monkeypatch.setattr("clients.phantombuster.PhantomBusterClient.reconcile_workspace", lambda self: None)
     monkeypatch.setattr("clients.attio.AttioClient.__init__", lambda self, *a, **k: None)
     monkeypatch.setattr("clients.attio.AttioClient.__enter__", lambda self: self)
     monkeypatch.setattr("clients.attio.AttioClient.__exit__", lambda self, *a: False)

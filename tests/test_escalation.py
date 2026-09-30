@@ -46,7 +46,7 @@ def mock_attio():
 class TestSlugInventory:
     """The 79-slug enum is the canonical contract — pin its shape."""
 
-    def test_total_slug_count_is_89(self):
+    def test_total_slug_count_is_99(self):
         # Per refactor-QA Rec #3: 89 original − 11 collapsed + 1 meta-slug = 79.
         # Wave-1.6 FIX-3 added 2 narrowed-fallback slugs:
         #   - pipeline_starvation_check_failed (cli.py starvation eval failure)
@@ -101,7 +101,7 @@ class TestSlugInventory:
         #     email reply and flipped email_campaign_stage; operator cue to
         #     read the note and take over the thread).
         # New count: 89 + 1 + 2 + 1 + 2 + 1 + 1 + 1 = 98.
-        assert len(ESCALATION_TYPES) == 98
+        assert len(ESCALATION_TYPES) == 99
 
     def test_no_duplicate_slugs(self):
         assert len(ESCALATION_TYPES) == len(ESCALATION_TYPES_SET)
@@ -541,18 +541,21 @@ class TestEscalateTransient500Retry:
                              "id": {"record_id": "rec_created"}}}
 
         mock_attio._request.side_effect = _request
-        result = escalation.escalate(
-            type="company_throttled",
-            idempotency_key="company-throttled|rec_p|2026-07-20",
-            payload={
-                "record_id": "rec_p",
-                "company_id": "rec_c",
-                "throttle_date": "2026-07-20",
-                "window_days": 30,
-            },
-            attio=mock_attio,
-        )
-        assert result["id"]["record_id"] == "rec_created"
+        from clients.attio import AmbiguousAttioWrite
+        with pytest.raises(AmbiguousAttioWrite):
+            escalation.escalate(
+                type="company_throttled",
+                idempotency_key="company-throttled|rec_p|2026-07-20",
+                payload={
+                    "record_id": "rec_p",
+                    "company_id": "rec_c",
+                    "throttle_date": "2026-07-20",
+                    "window_days": 30,
+                },
+                attio=mock_attio,
+            )
+
+        assert sum(c.args[1].endswith("/records") for c in mock_attio._request.call_args_list) == 1
 
     def test_survives_transient_500_on_idempotency_query(self, mock_attio):
         query_failures = [_transient_500()]
@@ -683,16 +686,19 @@ class TestEscalateTransient500Retry:
                              "id": {"record_id": "rec_created"}}}
 
         mock_attio._request.side_effect = _request
-        result = escalation.escalate(
-            type="dedup_review",
-            idempotency_key="dedup-probe-fail-1",
-            payload={
-                "canonical_linkedin_url": "url",
-                "record_ids": ["a", "b"],
-                "conflict_shape": "x",
-                "auto_mergeable": False,
-            },
-            attio=mock_attio,
-        )
-        assert result["id"]["record_id"] == "rec_created"
-        assert state["creates"] == 2
+        from clients.attio import AmbiguousAttioWrite
+        with pytest.raises(AmbiguousAttioWrite):
+            escalation.escalate(
+                type="dedup_review",
+                idempotency_key="dedup-probe-fail-1",
+                payload={
+                    "canonical_linkedin_url": "url",
+                    "record_ids": ["a", "b"],
+                    "conflict_shape": "x",
+                    "auto_mergeable": False,
+                },
+                attio=mock_attio,
+            )
+
+        assert sum(c.args[1].endswith("/records") for c in mock_attio._request.call_args_list) == 1
+        assert state["creates"] == 1

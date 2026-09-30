@@ -256,3 +256,19 @@ email is regulated (CAN-SPAM, GDPR, and local law). You are solely responsible
 for how you use this software. Read **[COMPLIANCE.md](COMPLIANCE.md)** and the
 safety notes in [GETTING_STARTED.md](GETTING_STARTED.md#safety--compliance)
 before sending.
+# Engine synchronization — September 2026
+
+The public engine includes query-only daily previews, verified inbox identity,
+exact invitation confirmation, bounded batch draining, fresh send-stage checks,
+ambiguous-write handling, preparation checkpoints, attended Codex dispatch and
+paced incremental Gmail inventory. Public CRM configuration, operator content
+and the machine-keyed single-operator ledger remain supported.
+
+Install complete skills with `bash scripts/install-skills.sh --codex sales-daily`
+for Codex, or omit `--codex` for Claude Code. `OUTBOUND_SKILLS_DIR` optionally
+sets an explicit installation directory. Review the installed skill before live
+use. See [the daily skill](skills/sales-daily/SKILL.md) and
+[attended dispatch](docs/llm_dispatch_skill_handoff.md).
+
+`sales daily --dry-run` reads inventory only; it does not verify a send batch.
+Optional Gmail inventory requires the `gmail` extra and operator credentials.

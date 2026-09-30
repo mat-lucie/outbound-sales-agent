@@ -22,6 +22,7 @@ from scripts.content_lint import (
     Severity,
     _banned_patterns_from_claims,
     _banned_phrases_rule,
+    _blank_copy_rule,
     _build_registry_fragments,
     _claim_gate_rule,
     _cold_email_site_link_rule,
@@ -30,6 +31,7 @@ from scripts.content_lint import (
     _load_default_emails,
     _load_default_messages,
     _register_mixing_rule,
+    _required_email_fields_rule,
     _worst_case_render_rule,
     lint_content,
 )
@@ -447,6 +449,58 @@ class TestColdEmailSiteLink:
 
 
 # ---------------------------------------------------------------------------
+# Rule 7: blank-copy
+# ---------------------------------------------------------------------------
+
+class TestBlankCopy:
+    def test_normal_subject_passes(self):
+        assert _blank_copy_rule("Quick question", "emails.email1.en.subject") == []
+
+    def test_normal_body_passes(self):
+        assert _blank_copy_rule("<p>Hola, ¿tienes 15 minutos?</p>", "emails.email1.es.body_html") == []
+
+    def test_empty_string_blocks(self):
+        findings = _blank_copy_rule("", "emails.email2.es.subject")
+        assert len(_blocks(findings)) == 1
+        assert findings[0].rule == "blank-copy"
+
+    def test_whitespace_only_blocks(self):
+        findings = _blank_copy_rule("   \n\t ", "emails.email3.en.subject")
+        assert len(_blocks(findings)) == 1
+
+    def test_markup_only_body_blocks(self):
+        # Tags stripped + entities unescaped → "<p>&nbsp;</p>" is blank.
+        findings = _blank_copy_rule("<p>&nbsp;</p>", "emails.wave2.es.body_html")
+        assert len(_blocks(findings)) == 1
+
+    def test_br_only_body_blocks(self):
+        findings = _blank_copy_rule("<p><br></p><p></p>", "emails.email2.pt.body_html")
+        assert len(_blocks(findings)) == 1
+
+    def test_entity_whitespace_blocks(self):
+        findings = _blank_copy_rule("&nbsp; &#160;", "emails.email2.en.body_html")
+        assert len(_blocks(findings)) == 1
+
+    def test_missing_subject_blocks(self):
+        findings = _required_email_fields_rule({"body_html": "<p>Hola</p>"}, "emails.email2.es")
+        assert len(_blocks(findings)) == 1
+        assert findings[0].location == "emails.email2.es.subject"
+
+    def test_missing_body_blocks(self):
+        findings = _required_email_fields_rule({"subject": "Hola"}, "emails.email2.es")
+        assert len(_blocks(findings)) == 1
+        assert findings[0].location == "emails.email2.es.body_html"
+
+    def test_non_string_field_blocks(self):
+        findings = _required_email_fields_rule({"subject": None, "body_html": "<p>x</p>"}, "emails.email2.es")
+        assert len(_blocks(findings)) == 1
+
+    def test_both_fields_present_passes(self):
+        content = {"subject": "Hola", "body_html": "<p>Hola</p>"}
+        assert _required_email_fields_rule(content, "emails.email2.es") == []
+
+
+# ---------------------------------------------------------------------------
 # Integration: lint_content() with fixture data
 # ---------------------------------------------------------------------------
 
@@ -534,6 +588,52 @@ class TestLintContentIntegration:
         findings = lint_content(self.CLEAN_MESSAGES, emails, self.CLEAN_CLAIMS)
         assert len(_blocks(findings)) >= 1
 
+    def test_emptied_email_subject_blocks(self):
+        emails = {
+            "email2": {
+                "es": {
+                    "subject": "",
+                    "body_html": "<p>Hola, ¿tienes 15 minutos para una demo?</p>",
+                }
+            }
+        }
+        findings = lint_content(self.CLEAN_MESSAGES, emails, self.CLEAN_CLAIMS)
+        blocks = _blocks(findings)
+        assert any(f.rule == "blank-copy" and f.location == "emails.email2.es.subject" for f in blocks)
+
+    @pytest.mark.parametrize("emails, location", [
+        ({"email2": ""}, "emails.email2"),
+        ({"email2": {"es": ""}}, "emails.email2.es"),
+    ])
+    def test_malformed_email_container_blocks(self, emails, location):
+        findings = lint_content(self.CLEAN_MESSAGES, emails, self.CLEAN_CLAIMS)
+        assert any(f.rule == "blank-copy" and f.location == location for f in _blocks(findings))
+
+    def test_emptied_email_body_blocks(self):
+        emails = {
+            "email3": {
+                "en": {
+                    "subject": "Closing the loop",
+                    "body_html": "<p>&nbsp;</p>",
+                }
+            }
+        }
+        findings = lint_content(self.CLEAN_MESSAGES, emails, self.CLEAN_CLAIMS)
+        blocks = _blocks(findings)
+        assert any(f.rule == "blank-copy" and f.location == "emails.email3.en.body_html" for f in blocks)
+
+    def test_email_missing_subject_field_blocks(self):
+        emails = {
+            "wave2": {
+                "pt": {
+                    "body_html": "<p>Olá, tem 15 minutos para uma demo?</p>",
+                }
+            }
+        }
+        findings = lint_content(self.CLEAN_MESSAGES, emails, self.CLEAN_CLAIMS)
+        blocks = _blocks(findings)
+        assert any(f.rule == "blank-copy" and f.location == "emails.wave2.pt.subject" for f in blocks)
+
 
 # ---------------------------------------------------------------------------
 # Live content gate — zero BLOCK rule (shipped placeholder content/)
@@ -550,7 +650,6 @@ def test_live_content_has_no_blockers():
     messages = _load_default_messages()
     emails = _load_default_emails()
     claims = _load_default_claims()
-
     findings = lint_content(messages, emails, claims)
     warns = _warns(findings)
     blocks = _blocks(findings)

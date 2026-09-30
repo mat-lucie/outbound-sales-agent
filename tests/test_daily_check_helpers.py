@@ -14,12 +14,17 @@ import pytest
 
 from models.campaign import Language, MessageStep, Persona, get_industry_label, get_message, personalize
 from workflows.daily_check import (
+    BlankMessageError,
     RecordCache,
     UnresolvedPlaceholderError,
     _assert_no_unresolved_placeholders,
     _dedupe_by_linkedin_url,
 )
-from workflows.daily_check_helpers import _parse_pb_sent_urls
+from workflows.daily_check_helpers import (
+    _assert_email_not_blank,
+    _assert_email_renderable,
+    _parse_pb_sent_urls,
+)
 from workflows.record_cache import preload_pipeline_persons
 
 # ── personalize() fallback ────────────────────────────────────────────────────
@@ -167,6 +172,79 @@ class TestPlaceholderGuard:
         with pytest.raises(UnresolvedPlaceholderError) as exc:
             _assert_no_unresolved_placeholders(rows, "dm2")
         assert "2 message(s)" in str(exc.value)
+
+
+# ── _assert_email_not_blank ────────────────────────────────────────────────────
+
+class TestEmailBlankGuard:
+    """Email counterpart of the blank-message guard. The email paths render
+    subject and body separately but run the placeholder guard over their
+    "{subject}\\n{body}" join — a blank subject is masked by a non-blank body
+    (and vice versa), so each part must be validated on its own.
+    """
+
+    def test_blank_subject_raises(self):
+        with pytest.raises(BlankMessageError) as exc:
+            _assert_email_not_blank("", "<p>Hola Mario</p>", "mario@corp.com", "email1")
+        msg = str(exc.value)
+        assert "subject" in msg
+        assert "email1" in msg
+        assert "mario@corp.com" in msg
+
+    def test_blank_body_raises(self):
+        with pytest.raises(BlankMessageError) as exc:
+            _assert_email_not_blank("Asunto claro", "", "mario@corp.com", "email2")
+        assert "body" in str(exc.value)
+
+    def test_both_blank_names_both_parts(self):
+        with pytest.raises(BlankMessageError) as exc:
+            _assert_email_not_blank("", "", "x@y.com", "wave2")
+        msg = str(exc.value)
+        assert "subject" in msg
+        assert "body" in msg
+
+    def test_whitespace_only_subject_counts_as_blank(self):
+        with pytest.raises(BlankMessageError):
+            _assert_email_not_blank("  \n\t ", "<p>ok</p>", "x@y.com", "email3")
+
+    def test_whitespace_only_body_counts_as_blank(self):
+        with pytest.raises(BlankMessageError):
+            _assert_email_not_blank("Asunto", "   ", "x@y.com", "email1")
+
+    def test_markup_skeleton_body_counts_as_blank(self):
+        """A bad template edit typically leaves the HTML skeleton behind —
+        the body must be judged on its rendered text, not the raw markup."""
+        for skeleton in ("<p></p>", "<div><br></div>", "<p>&nbsp;</p>"):
+            with pytest.raises(BlankMessageError) as exc:
+                _assert_email_not_blank("Asunto", skeleton, "x@y.com", "email2")
+            assert "body" in str(exc.value)
+
+    def test_passes_when_both_rendered(self):
+        _assert_email_not_blank("Asunto", "<p>Hola Mario</p>", "x@y.com", "email1")  # no raise
+
+
+# ── _assert_email_renderable ───────────────────────────────────────────────────
+
+class TestEmailRenderableGuard:
+    """Combined per-send guard: one call runs the placeholder check and the
+    blank check, so a new email path can't adopt one and forget the other."""
+
+    def test_raises_on_unresolved_placeholder(self):
+        with pytest.raises(UnresolvedPlaceholderError):
+            _assert_email_renderable(
+                "Hola", "Plantas de [industria] pierden horas.", "x@y.com", "email1"
+            )
+
+    def test_raises_on_blank_subject(self):
+        with pytest.raises(BlankMessageError):
+            _assert_email_renderable("", "<p>Hola Mario</p>", "x@y.com", "email1")
+
+    def test_raises_on_markup_skeleton_body(self):
+        with pytest.raises(BlankMessageError):
+            _assert_email_renderable("Asunto", "<p>&nbsp;</p>", "x@y.com", "wave2")
+
+    def test_passes_clean_email(self):
+        _assert_email_renderable("Asunto", "<p>Hola Mario</p>", "x@y.com", "email1")  # no raise
 
 
 # ── _parse_pb_sent_urls ────────────────────────────────────────────────────────

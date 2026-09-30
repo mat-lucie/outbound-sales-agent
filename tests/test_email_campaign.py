@@ -8,8 +8,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from models.email_campaign import detect_language
+from models.email_campaign import EmailStep, detect_language
 from workflows.daily_check import UnresolvedPlaceholderError
+from workflows.daily_check_helpers import BlankMessageError
 from workflows.email_campaign import (
     _domain_from_email,
     _is_collision,
@@ -447,6 +448,172 @@ class TestEmailPlaceholderGuard:
             run_email_daily(attio, resend=None, dry_run=True)
 
 
+class TestEmailBlankTemplateGuard:
+    """A template edit that empties one language's subject or body must halt
+    the run loudly at ZERO sends — not ship a subject-less email, record it
+    in the already_sent ledger, and advance the stage. Blankness is checked
+    pre-flight per distinct template (batch-level, like the DM guard) and
+    again per send as a backstop; the join the placeholder guard checks
+    ("{subject}\\n{body}") masks a blank half, so subject and body are
+    validated separately via _assert_email_not_blank.
+    """
+
+    def _attio_with_queued(self):
+        attio = MagicMock()
+        attio.search_people.side_effect = [
+            [_make_attio_person("r1", "John", "Doe", "john@acme.com", "queued")],
+            [],
+            [],
+        ]
+        return attio
+
+    @patch("workflows.email_campaign.get_email_template")
+    @patch("workflows.email_campaign.date")
+    @patch("workflows.email_campaign._build_linkedin_collision_set")
+    def test_email1_blank_subject_halts_batch(
+        self, mock_collision, mock_date, mock_template,
+    ):
+        mock_date.today.return_value = date(2026, 4, 7)  # Tuesday
+        mock_date.fromisoformat = date.fromisoformat
+        mock_collision.return_value = set()
+        mock_template.return_value = {"subject": "   ", "body_html": "<p>Hola John</p>"}
+
+        attio = self._attio_with_queued()
+        resend = MagicMock()
+
+        with pytest.raises(BlankMessageError) as exc:
+            run_email_daily(attio, resend, dry_run=False, auto_confirm=True)
+
+        assert "subject" in str(exc.value)
+        resend.send_email.assert_not_called()
+        attio.update_person.assert_not_called()
+
+    @patch("workflows.email_campaign.get_email_template")
+    @patch("workflows.email_campaign.date")
+    @patch("workflows.email_campaign._build_linkedin_collision_set")
+    def test_email1_blank_body_halts_batch(
+        self, mock_collision, mock_date, mock_template,
+    ):
+        mock_date.today.return_value = date(2026, 4, 7)
+        mock_date.fromisoformat = date.fromisoformat
+        mock_collision.return_value = set()
+        mock_template.return_value = {"subject": "Asunto claro", "body_html": ""}
+
+        attio = self._attio_with_queued()
+        resend = MagicMock()
+
+        with pytest.raises(BlankMessageError) as exc:
+            run_email_daily(attio, resend, dry_run=False, auto_confirm=True)
+
+        assert "body" in str(exc.value)
+        resend.send_email.assert_not_called()
+        attio.update_person.assert_not_called()
+
+    def _attio_with_sequenced(self):
+        attio = MagicMock()
+        attio.search_people.side_effect = [
+            [],
+            [_make_attio_person("r2", "Jane", "Smith", "jane@corp.com", "email1_sent", "2026-04-07")],
+            [],
+        ]
+        return attio
+
+    @patch("workflows.email_campaign.get_email_template")
+    @patch("workflows.email_campaign.date")
+    @patch("workflows.email_campaign._build_linkedin_collision_set")
+    def test_sequence_blank_subject_halts_batch(
+        self, mock_collision, mock_date, mock_template,
+    ):
+        mock_date.today.return_value = date(2026, 4, 10)  # Friday, 3 bdays after Tue
+        mock_date.fromisoformat = date.fromisoformat
+        mock_collision.return_value = set()
+        mock_template.return_value = {"subject": "", "body_html": "<p>Hola Jane</p>"}
+
+        attio = self._attio_with_sequenced()
+        resend = MagicMock()
+
+        with pytest.raises(BlankMessageError) as exc:
+            run_email_daily(attio, resend, dry_run=False, auto_confirm=True)
+
+        assert "subject" in str(exc.value)
+        assert "email2" in str(exc.value)
+        resend.send_email.assert_not_called()
+        attio.update_person.assert_not_called()
+
+    @patch("workflows.email_campaign.get_email_template")
+    @patch("workflows.email_campaign.date")
+    @patch("workflows.email_campaign._build_linkedin_collision_set")
+    def test_sequence_blank_body_halts_batch(
+        self, mock_collision, mock_date, mock_template,
+    ):
+        mock_date.today.return_value = date(2026, 4, 10)
+        mock_date.fromisoformat = date.fromisoformat
+        mock_collision.return_value = set()
+        mock_template.return_value = {"subject": "Asunto claro", "body_html": " \n "}
+
+        attio = self._attio_with_sequenced()
+        resend = MagicMock()
+
+        with pytest.raises(BlankMessageError) as exc:
+            run_email_daily(attio, resend, dry_run=False, auto_confirm=True)
+
+        assert "body" in str(exc.value)
+        resend.send_email.assert_not_called()
+        attio.update_person.assert_not_called()
+
+    @patch("workflows.email_campaign.get_email_template")
+    @patch("workflows.email_campaign.date")
+    @patch("workflows.email_campaign._build_linkedin_collision_set")
+    def test_dry_run_also_catches_blank_template(
+        self, mock_collision, mock_date, mock_template,
+    ):
+        # Dry-run must fail too, so CI catches template bugs without needing a real send.
+        mock_date.today.return_value = date(2026, 4, 7)
+        mock_date.fromisoformat = date.fromisoformat
+        mock_collision.return_value = set()
+        mock_template.return_value = {"subject": "", "body_html": "<p>Hola John</p>"}
+
+        attio = self._attio_with_queued()
+
+        with pytest.raises(BlankMessageError):
+            run_email_daily(attio, resend=None, dry_run=True)
+
+    @patch("workflows.email_campaign.get_email_template")
+    @patch("workflows.email_campaign.date")
+    @patch("workflows.email_campaign._build_linkedin_collision_set")
+    def test_blank_template_halts_at_zero_sends_across_the_whole_run(
+        self, mock_collision, mock_date, mock_template,
+    ):
+        """Pin the pre-flight contract: a blank email2 template halts the run
+        BEFORE the healthy email1 contact sends — zero sends, not a partial
+        batch whose blast radius depends on contact ordering."""
+        mock_date.today.return_value = date(2026, 4, 10)  # Friday, 3 bdays after Tue
+        mock_date.fromisoformat = date.fromisoformat
+        mock_collision.return_value = set()
+        mock_template.side_effect = lambda step, language: (
+            {"subject": "", "body_html": "<p>Hola Jane</p>"}
+            if step == EmailStep.EMAIL2
+            else {"subject": "Asunto claro", "body_html": "<p>Hola John</p>"}
+        )
+
+        attio = MagicMock()
+        attio.search_people.side_effect = [
+            # QUEUED — healthy email1 template, would send if the loop ran
+            [_make_attio_person("r1", "John", "Doe", "john@acme.com", "queued")],
+            # EMAIL1_SENT — due email2, whose template is blank
+            [_make_attio_person("r2", "Jane", "Smith", "jane@corp.com", "email1_sent", "2026-04-07")],
+            [],
+        ]
+        resend = MagicMock()
+
+        with pytest.raises(BlankMessageError) as exc:
+            run_email_daily(attio, resend, dry_run=False, auto_confirm=True)
+
+        assert "email2" in str(exc.value)
+        resend.send_email.assert_not_called()
+        attio.update_person.assert_not_called()
+
+
 class TestReplyScanMaps:
     """Phase 0.6 (PR-243) stage-selection + classification maps."""
 
@@ -470,3 +637,12 @@ class TestReplyScanMaps:
         assert EMAIL_CLASS_TO_STAGE["negative"] == EmailStage.NOT_INTERESTED
         for cls in ("positive", "question", "neutral", "defensive"):
             assert EMAIL_CLASS_TO_STAGE[cls] == EmailStage.RESPONDED
+
+
+@pytest.fixture(autouse=True)
+def _email_guard_unit_boundary():
+    # This suite covers rendering/caps/collision; real guard behavior is pinned
+    # independently in test_public_send_preconditions.py.
+    from workflows.email_send_guard import GuardResult
+    with patch("workflows.email_campaign.verify_email_send_preconditions", return_value=GuardResult(True)):
+        yield

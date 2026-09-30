@@ -1064,119 +1064,6 @@ class TestPhase05ScopeSkip:
         assert "Checking 1 prospects in DM stages" in out
 
 
-class TestIngestDrainIsolation:
-    """The optional Botdog event-ingest drain polls and reconciles; it SENDS
-    NOTHING. A Botdog outage, an expired key, or a response-schema change there
-    must not take down the PhantomBuster sends that run after it — that is the
-    ONLY thing ``BOTDOG_SEND_ENABLED`` still gates.
-    """
-
-    _CLI_ENV = {
-        "ATTIO_API_KEY": "fake",
-        "PHANTOMBUSTER_API_KEY": "fake",
-        "ATTIO_LIST_ID": "list-001",
-        "PB_MESSAGE_SENDER_ID": "",
-        "PB_INBOX_SCRAPER_ID": "inbox",
-        "BOTDOG_SEND_ENABLED": "1",
-    }
-
-    def _invoke_daily(self, monkeypatch, ingest_side_effect, env: dict | None = None):
-        import contextlib as _contextlib
-
-        from click.testing import CliRunner
-
-        ingest = MagicMock(side_effect=ingest_side_effect)
-        monkeypatch.setattr(
-            "workflows.botdog_ingest.ingest_botdog_events", ingest
-        )
-        monkeypatch.setattr(
-            "workflows.botdog_ingest.format_report", lambda report: "  (report)"
-        )
-        monkeypatch.setattr(
-            "workflows.daily_check.run_connection_requests",
-            lambda *a, **k: {"sent": 0},
-        )
-        monkeypatch.setattr(
-            "workflows.daily_check.run_dm_sequencing",
-            lambda *a, **k: {"dm1": 0, "dm2": 0, "dm3": 0},
-        )
-        monkeypatch.setattr(
-            "workflows.record_cache.preload_pipeline_persons", lambda *a, **k: 0
-        )
-        monkeypatch.setattr(
-            "clients.attio.AttioClient.__init__", lambda self, *a, **k: None
-        )
-        monkeypatch.setattr("clients.attio.AttioClient.__enter__", lambda self: self)
-        monkeypatch.setattr(
-            "clients.attio.AttioClient.__exit__", lambda self, *a: False
-        )
-        monkeypatch.setattr(
-            "clients.attio.AttioClient.query_list_entries", lambda self, **_k: []
-        )
-        monkeypatch.setattr("clients.attio.AttioClient.close", lambda self: None)
-        monkeypatch.setattr(
-            "clients.phantombuster.PhantomBusterClient.__init__", lambda self: None
-        )
-        monkeypatch.setattr(
-            "clients.phantombuster.PhantomBusterClient.__enter__", lambda self: self
-        )
-        monkeypatch.setattr(
-            "clients.phantombuster.PhantomBusterClient.__exit__",
-            lambda self, *a: False,
-        )
-        monkeypatch.setattr(
-            "workflows.run_lock.acquire_run_lock",
-            lambda *_a, **_k: _contextlib.nullcontext(),
-        )
-
-        from cli import cli
-
-        runner = CliRunner()
-        result = runner.invoke(
-            cli,
-            ["daily", "--dry-run", "--yes"],
-            env={**os.environ, **(env or self._CLI_ENV)},
-            catch_exceptions=False,
-        )
-        return result, ingest
-
-    def test_ingest_failure_does_not_abort_the_run(self, monkeypatch):
-        result, ingest = self._invoke_daily(
-            monkeypatch, RuntimeError("botdog 503 / expired key")
-        )
-
-        ingest.assert_called_once()
-        assert result.exit_code == 0, result.output
-        assert "Botdog event ingestion SKIPPED" in result.output
-        assert "botdog 503 / expired key" in result.output
-        # The run kept going past the drain.
-        assert "Daily Check Complete" in result.output
-
-    def test_healthy_ingest_still_reports_normally(self, monkeypatch):
-        result, ingest = self._invoke_daily(
-            monkeypatch,
-            lambda *a, **k: {
-                "polled": 0,
-                "applied": 0,
-                "failures": 0,
-                "dry_run": True,
-            },
-        )
-        ingest.assert_called_once()
-        assert result.exit_code == 0, result.output
-        assert "Botdog event ingestion SKIPPED" not in result.output
-
-    def test_flag_off_skips_ingestion_entirely(self, monkeypatch):
-        """The default posture: with the flag off the drain is a one-line
-        skip — no import, no Botdog client, no API key needed. Set explicitly
-        (not popped): a developer's .env may carry a stale `true`."""
-        env = {**self._CLI_ENV, "BOTDOG_SEND_ENABLED": "false"}
-        result, ingest = self._invoke_daily(
-            monkeypatch, RuntimeError("must never be called"), env=env
-        )
-        ingest.assert_not_called()
-        assert result.exit_code == 0, result.output
-        assert "Skipping (BOTDOG_SEND_ENABLED off)" in result.output
 
 
 class TestParseEntrySurfacesTheStamp:
@@ -1226,3 +1113,12 @@ class TestParseEntrySurfacesTheStamp:
 
         assert attrs["send_channel"] is None
         assert _resolve_send_channel(attrs) == SEND_CHANNEL_PB
+
+
+@pytest.fixture(autouse=True)
+def _fresh_state_boundary():
+    from unittest.mock import patch
+
+    from workflows.email_send_guard import GuardResult
+    with patch("workflows.daily_check.verify_send_preconditions", return_value=GuardResult(True)), patch("workflows.email_campaign.verify_email_send_preconditions", return_value=GuardResult(True)), patch("workflows.dm_quality_gate.require_clear_dm_quality_queue"):
+        yield

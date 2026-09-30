@@ -606,7 +606,7 @@ class TestSelfEchoSignatureIdempotency:
         pb = MagicMock()
         attio.query_list_entries.return_value = [self._make_entry()]
         pb.download_result_csv.return_value = self._make_sn_csv(
-            participantProfileUrl="https://linkedin.com/sales/people/ACw",
+            participantProfileUrl=_LONG,
             participantFullName="Dana Quiroga Ramos",
             isLastMessageFromMe="true",
             lastMessageBody=echoed,
@@ -857,6 +857,8 @@ class TestDmAdvanceGateVariantEcho:
             last_contact_date=two_days_ago,
         )
         attio = _attio_with_full_schema()
+        from tests.fakes import stub_guard_reread
+        stub_guard_reread(attio, [entry])
         # The sender reports the send under the CURRENT (short) slug; the
         # `query` column is absent — the incident shape.
         pb = _typed_pb_mock(

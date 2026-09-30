@@ -67,7 +67,7 @@ class TestDM1ReservationOnTrim:
         )
         _get_entries.return_value = ([], entries)
 
-        attio = _attio_with_full_schema()
+        attio = _attio_with_full_schema(_person_to_company={})
         pb = MagicMock()
         pb.download_result_csv.return_value = ""
         cache = self._setup_cache()
@@ -105,7 +105,7 @@ class TestDM1ReservationOnTrim:
         )
         _get_entries.return_value = ([], entries)
 
-        attio = _attio_with_full_schema()
+        attio = _attio_with_full_schema(_person_to_company={})
         pb = MagicMock()
         cache = self._setup_cache()
 
@@ -136,7 +136,7 @@ class TestDM1ReservationOnTrim:
         )
         _get_entries.return_value = ([], entries)
 
-        attio = _attio_with_full_schema()
+        attio = _attio_with_full_schema(_person_to_company={})
         pb = MagicMock()
         cache = self._setup_cache()
 
@@ -351,7 +351,7 @@ class TestDM1ReservationOnTrim:
         )
         _get_entries.return_value = ([], entries)
 
-        attio = _attio_with_full_schema()
+        attio = _attio_with_full_schema(_person_to_company={})
         pb = MagicMock()
         cache = self._setup_cache()
 

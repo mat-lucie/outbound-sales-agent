@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import time
+import uuid
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -173,12 +174,14 @@ def write_prospects_to_sheet(
     spreadsheet_id: str | None = None,
     worksheet_name: str = "Sheet1",
     columns: list[str] | None = None,
+    include_header: bool = True,
 ) -> str:
     """Write prospect rows to a Google Sheet, replacing all existing data.
 
     Columns default to ``["linkedInUrl", "message"]`` (the Network Booster /
     Message Sender input shape). Pass ``columns`` to override — e.g. Phase-0
-    Profile Scraper expects a single ``profileUrl`` column.
+    Profile Scraper inputs should pass ``columns=["profileUrl"]`` and
+    ``include_header=False``: the phantom processes a header as a profile.
 
     Row keys must match the requested column names exactly (case-sensitive).
     Returns the spreadsheet URL for use as a PB phantom input.
@@ -192,10 +195,34 @@ def write_prospects_to_sheet(
     try:
         ws = sh.worksheet(worksheet_name)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=worksheet_name, rows=len(rows) + 1, cols=len(columns))
+        ws = sh.add_worksheet(
+            title=worksheet_name, rows=len(rows) + int(include_header), cols=len(columns)
+        )
 
     _with_retry(ws.clear)
-    data = [columns] + [[row.get(col, "") for col in columns] for row in rows]
+    data = ([columns] if include_header else []) + [
+        [row.get(col, "") for col in columns] for row in rows
+    ]
     _with_retry(lambda: ws.update(data, "A1"))
 
     return f"https://docs.google.com/spreadsheets/d/{sid}"
+
+
+def write_identity_batch(urls: list[str]) -> str:
+    """Write an isolated, headerless input tab without replacing another run's input.
+
+    The tab inherits the configured input spreadsheet's access policy. Retain
+    it after timeout: the provider may still be reading it. No sharing changes.
+    """
+    if not urls or len(urls) > 50:
+        raise ValueError("Identity batch must contain between 1 and 50 URLs")
+    sid = os.environ["GSHEET_AUTOCONNECT_ID"]
+    sh = get_client().open_by_key(sid)
+    # Do not retry creation after an ambiguous response: another tab may exist.
+    ws = sh.add_worksheet(title=f"inbox-identity-{uuid.uuid4().hex}", rows=len(urls), cols=1)
+    data = [[url] for url in urls]
+    from gspread.utils import ValueInputOption
+    _with_retry(lambda: ws.update(data, "A1", value_input_option=ValueInputOption.raw))
+    if ws.get_all_values() != data:
+        raise ValueError("Identity input tab readback differs from requested URLs")
+    return f"https://docs.google.com/spreadsheets/d/{sid}/edit#gid={ws.id}"

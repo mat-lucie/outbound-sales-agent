@@ -229,6 +229,10 @@ def test_scrape_config_error_propagates_no_write():
     spy.assert_not_called()
 
 
+
+
+
+
 def test_rows_with_no_resolvable_url_skipped_loudly():
     """A row with neither canonical_linkedin_url nor a person `linkedin` field
     must be COUNTED and skipped — never silently dropped, never flipped."""

@@ -17,6 +17,7 @@ gate predicate consumed by send-phantom callers.
 """
 
 import json
+import logging
 import re
 import time
 from datetime import UTC, datetime
@@ -35,6 +36,9 @@ from clients.pb_envelope import (
     PBRunTimeout,
     hash_arguments,
 )
+from workflows.run_evidence import observed, timed_call
+
+logger = logging.getLogger(__name__)
 
 
 def get_phantombuster_credentials() -> tuple[str, str]:
@@ -53,6 +57,7 @@ class PhantomBusterClient:
 
     def __init__(self, api_key: str | None = None):
         self.api_key = api_key or require_api_key()
+        self._timed_out_launches: dict[str, PBLaunch] = {}
         self._client = httpx.Client(
             base_url=self.BASE_URL,
             headers={
@@ -62,6 +67,7 @@ class PhantomBusterClient:
             timeout=30.0,
         )
 
+    @observed("pb.request", "api")
     def _request(self, method: str, path: str, **kwargs) -> dict:
         resp = self._client.request(method, path, **kwargs)
         resp.raise_for_status()
@@ -70,7 +76,16 @@ class PhantomBusterClient:
     def list_agents(self) -> list[dict]:
         """List all configured phantoms (agents)."""
         data = self._request("GET", "/agents/fetch-all")
-        return data if isinstance(data, list) else data.get("data", [])
+        agents = data if isinstance(data, list) else data.get("data") if isinstance(data, dict) else None
+        if not isinstance(agents, list) or any(
+            not isinstance(agent, dict)
+            or not isinstance(agent.get("id"), (str, int))
+            or isinstance(agent.get("id"), bool)
+            or not str(agent["id"]).strip()
+            for agent in agents
+        ):
+            raise RuntimeError("PB workspace inventory is unconfirmed; inspect provider state before retry")
+        return agents
 
     def get_agent(self, agent_id: str) -> dict:
         """Get details for a specific phantom."""
@@ -103,6 +118,7 @@ class PhantomBusterClient:
     # executions reached". Back off and retry — another phantom will finish.
     _LAUNCH_BACKOFF_SCHEDULE = (30, 60, 120, 240, 480)  # seconds, ~15 min total
 
+    @observed("pb.launch", "launch")
     def launch_agent(
         self, agent_id: str, arguments: dict | None = None
     ) -> PBLaunch:
@@ -116,6 +132,16 @@ class PhantomBusterClient:
         polling and CSV fetch key off this value, not the agent id —
         re-launches of the same agent get fresh container ids.
         """
+        # A local polling timeout does not stop the remote job. Reconcile it
+        # before launching ANY phantom in this workspace/client session.
+        for pending in list(self._timed_out_launches.values()):
+            print(f"  Waiting for earlier PB container {pending.container_id} before another launch...")
+            try:
+                self.wait_for_completion(pending, poll_interval=15, max_wait=900)
+            except PBRunFailed as exc:
+                # Terminal provider failure still frees the slot. The original
+                # caller already received the timeout; never reuse its results.
+                logger.error("Earlier PB container %s failed during reconciliation: %s", pending.container_id, exc)
         body: dict = {"id": agent_id}
         if arguments:
             body["arguments"] = arguments
@@ -163,6 +189,36 @@ class PhantomBusterClient:
                     raise
         raise RuntimeError("unreachable")
 
+    def reconcile_workspace(self) -> None:
+        """Read provider state before a fresh live daily/DM session launches jobs.
+
+        Process-local timeout tracking cannot survive an aborted CLI. Enumerate
+        the actual workspace so an earlier job (including another agent) keeps
+        a new run from launching into its occupied slot. Unknown state blocks.
+        """
+        for agent in self.list_agents():
+            agent_id = str(agent["id"])
+            try:
+                output = self.get_output(agent_id)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    continue  # Agent exists but has never produced a run.
+                raise
+            container = output.get("containerId")
+            running = output.get("isAgentRunning")
+            status = output.get("status")
+            if running is False and (status in ("finished", "error") or not container):
+                continue
+            if not container or running is None:
+                raise RuntimeError(f"PB running state is unconfirmed for agent {agent_id}; inspect workspace before retry")
+            launch = PBLaunch(container_id=str(container), agent_id=agent_id,
+                              launched_at=datetime.now(UTC), arguments_sha256="reconciled-existing-run")
+            print(f"  Reconciling existing PB container {container} before live run...")
+            try:
+                self.wait_for_completion(launch, poll_interval=15, max_wait=900)
+            except PBRunFailed as exc:
+                logger.error("Existing PB container %s failed during reconciliation: %s", container, exc)
+
     def get_output(self, agent_id_or_container: str) -> dict:
         """Get the output/results of an agent run.
 
@@ -197,6 +253,7 @@ class PhantomBusterClient:
             params={"id": agent_id, "containerId": container_id},
         )
 
+    @observed("pb.wait", "poll")
     def wait_for_completion(
         self,
         launch: PBLaunch,
@@ -244,22 +301,22 @@ class PhantomBusterClient:
                 # Transient — let the next poll iteration retry. Do
                 # NOT raise the bare HTTP error past the typed
                 # PBRunTimeout boundary the docstring promises.
-                time.sleep(poll_interval)
+                timed_call("pb.poll_sleep", "poll_wait", time.sleep, poll_interval)
                 elapsed += poll_interval
                 continue
             last_output = output
             last_status = output.get("status", "") or None
-            is_running = output.get("isAgentRunning", False)
+            is_running = output.get("isAgentRunning")
             # PB's fetch-output returns the agent's LATEST run; only accept a
-            # terminal status when it's OUR container. A response without a
-            # containerId (e.g. test stubs) defaults to a match for
-            # back-compat. This prevents returning a prior run's result while
+            # terminal status when it's explicitly OUR container. This prevents
+            # returning an unattributed or prior run's result while
             # ours is still queued (the F-PR-5 "latest CSV" hazard).
             is_our_container = (
-                output.get("containerId", launch.container_id)
+                output.get("containerId")
                 == launch.container_id
             )
-            if is_our_container and not is_running and last_status in ("finished", "error"):
+            if is_our_container and is_running is False and last_status in ("finished", "error"):
+                self._timed_out_launches.pop(launch.container_id, None)
                 log_output = output.get("output", "") or ""
                 if last_status == "error":
                     raise PBRunFailed(
@@ -273,8 +330,9 @@ class PhantomBusterClient:
                     log_output=log_output,
                     raw_output=output,
                 )
-            time.sleep(poll_interval)
+            timed_call("pb.poll_sleep", "poll_wait", time.sleep, poll_interval)
             elapsed += poll_interval
+        self._timed_out_launches[launch.container_id] = launch
         raise PBRunTimeout(
             container_id=launch.container_id,
             agent_id=launch.agent_id,
@@ -318,6 +376,7 @@ class PhantomBusterClient:
             )
         return None
 
+    @observed("pb.result_csv", "api")
     def download_result_csv(
         self, launch: PBLaunch, *, csv_name: str = "result"
     ) -> str | None:
@@ -344,12 +403,18 @@ class PhantomBusterClient:
         try:
             resp = httpx.get(url, timeout=30.0)
             resp.raise_for_status()
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
             # With per-launch csvName the agent-scoped fallback URL may not
             # exist (e.g. PB ignored the argument and wrote result.csv, or
             # the log line was truncated). A missing/erroring CSV must read
             # as "no CSV" — callers route that into their no-data degrade
             # paths — not as an unhandled crash that kills the daily run.
+            status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+            logger.warning(
+                "CSV retrieval unavailable for container %s (%s, HTTP status %s); "
+                "no result consumed. Inspect provider output before retrying a workflow.",
+                launch.container_id, type(exc).__name__, status,
+            )
             return None
         return resp.text
 

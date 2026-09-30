@@ -210,9 +210,13 @@ _PLACEHOLDER_RE = re.compile(r"\[[^\[\]\n]+\]")
 class UnresolvedPlaceholderError(RuntimeError):
     """Raised when an outbound message still contains a [...] template token."""
 
+    partial_results: dict | None = None
+
 
 class BlankMessageError(RuntimeError):
     """Raised when an outbound message rendered to empty/whitespace text."""
+
+    partial_results: dict | None = None
 
 
 def _dedupe_by_linkedin_url(rows: list[dict]) -> tuple[list[dict], list[str]]:
@@ -308,6 +312,64 @@ def _assert_no_blank_messages(rows: list[dict], step_label: str) -> None:
             f"reserved — earlier batches in the same run may already have "
             f"sent). Affected: {preview}"
         )
+
+
+def _assert_email_not_blank(
+    subject: str, body: str, recipient: str, step_label: str
+) -> None:
+    """Refuse to send an email whose subject or body is blank.
+
+    Email counterpart of _assert_no_blank_messages. The email paths render
+    subject and body separately but run the placeholder guard over their
+    "{subject}\\n{body}" join — a blank subject is masked by a non-blank body
+    (and vice versa), so each part must be validated on its own. A blank
+    render is the same systemic template break the DM guard catches (e.g. a
+    template edit emptying one language's subject): without this guard,
+    Resend ships the email with an empty subject, the already_sent ledger
+    records it, and the stage advances — silent and prospect-visible.
+
+    The body is judged on its rendered text (tags stripped, entities
+    unescaped), not the raw markup: a bad template edit typically leaves the
+    HTML skeleton behind ("<p></p>", "<p>&nbsp;</p>"), which a raw strip()
+    would wave through while the prospect sees an empty email.
+
+    Called two ways by the email send paths: pre-flight over each distinct
+    template in the batch (so a systemic break halts at ZERO sends, matching
+    the DM batch guard), and per-send on the rendered copy as a backstop.
+    A backstop halt can land mid-run — the message stays honest about that.
+    """
+    from workflows.email_compliance import html_to_text
+
+    blank_parts = [
+        label
+        for label, text in (("subject", subject), ("body", html_to_text(body or "")))
+        if not (text or "").strip()
+    ]
+    if blank_parts:
+        raise BlankMessageError(
+            f"Refusing to send {step_label} for {recipient}: "
+            f"{' and '.join(blank_parts)} blank — template rendering likely "
+            f"broke upstream. The {step_label} batch was halted before this "
+            f"send went out; sends completed earlier in the run (if any) "
+            f"already shipped and were recorded. Check the {step_label} "
+            f"email templates before re-running."
+        )
+
+
+def _assert_email_renderable(
+    subject: str, body: str, recipient: str, step_label: str
+) -> None:
+    """Run both per-send email guards: no unresolved placeholders, not blank.
+
+    One call site per send path instead of a hand-copied pair — a future
+    email path that adopts this can't take the placeholder guard and forget
+    the blank guard (the omission that let blank subjects ship before).
+    """
+    _assert_no_unresolved_placeholders(
+        [{"message": f"{subject}\n{body}", "linkedInUrl": recipient}],
+        step_label,
+    )
+    _assert_email_not_blank(subject, body, recipient, step_label)
 
 
 def _parse_pb_sent_urls_from_csv(csv_text: str) -> tuple[set[str], set[str]]:

@@ -278,6 +278,7 @@ def test_cli_daily_emits_daily_run_collision_and_exits_75():
 
         attio_instance = MagicMock()
         attio_instance.query_list_entries.return_value = []
+        mock_attio_cls.return_value.query_list_entries.return_value = []
         mock_attio_cls.return_value.__enter__ = lambda self: attio_instance
         mock_attio_cls.return_value.__exit__ = lambda self, *a: None
         mock_pb_cls.return_value.__enter__ = lambda self: MagicMock()
@@ -343,6 +344,7 @@ def test_cli_daily_malformed_prior_row_exits_75():
 
         attio_instance = MagicMock()
         attio_instance.query_list_entries.return_value = []
+        mock_attio_cls.return_value.query_list_entries.return_value = []
         mock_attio_cls.return_value.__enter__ = lambda self: attio_instance
         mock_attio_cls.return_value.__exit__ = lambda self, *a: None
         mock_pb_cls.return_value.__enter__ = lambda self: MagicMock()
@@ -375,7 +377,7 @@ def test_cli_daily_dry_run_skips_daily_run_open():
 
     with patch("workflows.run_lock.acquire_run_lock") as mock_lock, \
          patch("workflows.audit.AuditLogger") as mock_audit, \
-         patch("clients.attio.AttioClient") as mock_attio_cls, \
+         patch("workflows.daily_preview.ReadOnlyPipelineClient") as mock_attio_cls, \
          patch("clients.phantombuster.PhantomBusterClient") as mock_pb_cls, \
          patch("workflows.daily_run.open_daily_run") as mock_open_dr, \
          patch("workflows.record_cache.preload_pipeline_persons", return_value=0), \
@@ -386,6 +388,7 @@ def test_cli_daily_dry_run_skips_daily_run_open():
         mock_audit.return_value.__exit__ = lambda self, *a: None
         attio_instance = MagicMock()
         attio_instance.query_list_entries.return_value = []
+        mock_attio_cls.return_value.query_list_entries.return_value = []
         mock_attio_cls.return_value.__enter__ = lambda self: attio_instance
         mock_attio_cls.return_value.__exit__ = lambda self, *a: None
         mock_pb_cls.return_value.__enter__ = lambda self: MagicMock()
@@ -430,6 +433,7 @@ def test_cli_daily_still_exits_75_when_escalate_itself_fails():
 
         attio_instance = MagicMock()
         attio_instance.query_list_entries.return_value = []
+        mock_attio_cls.return_value.query_list_entries.return_value = []
         mock_attio_cls.return_value.__enter__ = lambda self: attio_instance
         mock_attio_cls.return_value.__exit__ = lambda self, *a: None
         mock_pb_cls.return_value.__enter__ = lambda self: MagicMock()
@@ -454,3 +458,12 @@ def test_cli_daily_still_exits_75_when_escalate_itself_fails():
         f"expected exit 75 (EX_TEMPFAIL) even when escalate() fails, got "
         f"{result.exit_code}; output={result.output!r}"
     )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_state_boundary():
+    from unittest.mock import patch
+
+    from workflows.email_send_guard import GuardResult
+    with patch("workflows.daily_check.verify_send_preconditions", return_value=GuardResult(True)), patch("workflows.email_campaign.verify_email_send_preconditions", return_value=GuardResult(True)), patch("workflows.dm_quality_gate.require_clear_dm_quality_queue"):
+        yield
