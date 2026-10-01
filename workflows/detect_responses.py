@@ -138,6 +138,9 @@ def _empty_counts() -> dict:
         "manual_touch_state_unreadable": 0,
         "manual_touch_state_write_failed": 0,
         "manual_touch_pass_crashed": 0,
+        "manual_touch_unknown_direction": 0,
+        "manual_touch_missing_name": 0,
+        "manual_touch_empty_body": 0,
         "manual_touch_guard_offline": 0,
         "manual_touch_ambiguous_name": 0,
         "manual_touch_date_fallback": 0,
@@ -1559,6 +1562,8 @@ def _detect_manual_touches(
       manual_touch_note_failed     — note write failed (retried next run)
       manual_touch_state_unreadable / manual_touch_state_write_failed
                                    — local state file problems (loud)
+      manual_touch_unknown_direction — missing/invalid sender-direction column
+      manual_touch_missing_name / manual_touch_empty_body — incomplete rows
       manual_touch_guard_offline   — template matcher unavailable → pass skipped
       identity_holds             — no verified profile match → row skipped
       manual_touch_date_fallback   — row had no parsable lastMessageDate
@@ -1594,17 +1599,25 @@ def _detect_manual_touches(
     dirty = False
     try:
         for row in scraped_threads:
-            raw_from_me = row.get("isLastMessageFromMe", "").strip().lower()
+            direction_value = row.get("isLastMessageFromMe")
+            raw_from_me = direction_value.strip().lower() if isinstance(direction_value, str) else ""
             if raw_from_me not in ("true", "false"):
                 # Missing/renamed column or garbage: inert. Never read an
                 # unknown value as "the prospect wrote last" — that would
                 # flip every recorded entry to theirs and black out the
                 # radar's cold-responder lane silently.
+                counts["manual_touch_unknown_direction"] += 1
                 continue
             from_me = raw_from_me == "true"
-            participant_name = row.get("participantFullName", "").strip()
-            last_body = row.get("lastMessageBody", "").strip()
-            if not participant_name or (from_me and not last_body):
+            name_value = row.get("participantFullName")
+            body_value = row.get("lastMessageBody")
+            participant_name = name_value.strip() if isinstance(name_value, str) else ""
+            last_body = body_value.strip() if isinstance(body_value, str) else ""
+            if not participant_name:
+                counts["manual_touch_missing_name"] += 1
+                continue
+            if from_me and not last_body:
+                counts["manual_touch_empty_body"] += 1
                 continue
             candidates = [
                 a for a in _resolve_thread_entries(
@@ -1709,10 +1722,6 @@ def _detect_manual_touches(
                 if not stamped:
                     continue
                 counts["manual_touches_detected"] += 1
-                click.echo(
-                    f"  Manual DM detected for {participant_name} (entry {entry_id}) "
-                    f"→ last_contact_date={touch_date}, note 'DM manual — {touch_date}'."
-                )
                 note_ok = _write_manual_touch_note(
                     attio,
                     record_id=record_id,
@@ -1721,6 +1730,19 @@ def _detect_manual_touches(
                     participant_name=participant_name,
                     entry_id=entry_id,
                     counts=counts,
+                )
+                date_action = (
+                    f"last_contact_date unchanged ({existing})"
+                    if existing and existing >= touch_date else
+                    f"last_contact_date updated to {touch_date}"
+                )
+                note_action = (
+                    f"note 'DM manual — {touch_date}' created"
+                    if note_ok else "note write failed; will retry next run"
+                )
+                click.echo(
+                    f"  Manual DM detected for {participant_name} (entry {entry_id}) "
+                    f"→ {date_action}; {note_action}."
                 )
                 state[entry_id] = {
                     "fingerprint": fingerprint,
@@ -2807,7 +2829,8 @@ def detect_responses(
         click.echo(
             f"  ❌ manual-touch pass crashed ({type(exc).__name__}: {exc}). "
             f"Phase 0.5 continues. {counts['manual_touches_detected']} manual "
-            f"DM(s) were recorded before the crash (fingerprints saved); the "
+            f"DM(s) were recorded before the crash; fingerprint save failures: "
+            f"{counts['manual_touch_state_write_failed']}. The "
             f"rest were NOT stamped this run. Traceback:\n"
             f"{traceback.format_exc()}",
             err=True,

@@ -1063,6 +1063,8 @@ class TestManualTouchDetection:
             "manual_touches_detected", "manual_touch_failed", "manual_touch_note_failed",
             "manual_touch_state_unreadable", "manual_touch_state_write_failed",
             "manual_touch_pass_crashed", "manual_touch_guard_offline",
+            "manual_touch_unknown_direction", "manual_touch_missing_name",
+            "manual_touch_empty_body",
             "manual_touch_ambiguous_name", "manual_touch_date_fallback",
             "manual_touch_prospect_replied",
         ):
@@ -1074,6 +1076,55 @@ class TestManualTouchDetection:
             "linkedin_outreach", "last_contact_date",
             "workflows.detect_responses._detect_manual_touches",
         )
+
+    @pytest.mark.parametrize("value", ["", "unknown", None, True, {}])
+    def test_invalid_sender_direction_is_counted_without_writes(self, tmp_path, value):
+        counts, attio, state_path = self._run(
+            tmp_path, rows=[self._row(from_me=value)], entries=[self._entry()],
+        )
+        assert counts["manual_touch_unknown_direction"] == 1
+        assert counts["manual_touches_detected"] == 0
+        attio.update_list_entry.assert_not_called()
+        attio.create_note.assert_not_called()
+        assert not state_path.exists()
+
+    @pytest.mark.parametrize("field,counter", [
+        ("participantFullName", "manual_touch_missing_name"),
+        ("lastMessageBody", "manual_touch_empty_body"),
+    ])
+    @pytest.mark.parametrize("value", ["", "  ", None, {}])
+    def test_incomplete_row_is_counted_without_writes(self, tmp_path, field, counter, value):
+        row = {**self._row(), field: value}
+        counts, attio, state_path = self._run(tmp_path, rows=[row], entries=[self._entry()])
+        assert counts[counter] == 1
+        assert counts["manual_touches_detected"] == 0
+        attio.update_list_entry.assert_not_called()
+        attio.create_note.assert_not_called()
+        assert not state_path.exists()
+
+    def test_note_failure_log_reports_actual_date_write(self, tmp_path, capsys):
+        import httpx
+
+        attio = MagicMock()
+        attio.create_note.side_effect = httpx.RequestError("note service unavailable")
+        counts, _, _ = self._run(
+            tmp_path, rows=[self._row()], entries=[self._entry()], attio=attio,
+        )
+        output = capsys.readouterr().out
+        assert counts["manual_touch_note_failed"] == 1
+        assert "last_contact_date updated to 2026-09-01" in output
+        assert "note write failed; will retry next run" in output
+        assert "created" not in output
+
+    def test_note_only_log_preserves_existing_contact_date(self, tmp_path, capsys):
+        _, attio, _ = self._run(
+            tmp_path, rows=[self._row()], entries=[self._entry(last_contact="2026-09-02")],
+        )
+        output = capsys.readouterr().out
+        attio.update_list_entry.assert_not_called()
+        assert "last_contact_date unchanged (2026-09-02)" in output
+        assert "note 'DM manual — 2026-09-01' created" in output
+        assert "updated to" not in output
 
     def test_stamps_note_and_state_on_new_manual_touch(self, tmp_path):
         counts, attio, state_path = self._run(
@@ -1317,7 +1368,7 @@ class TestManualTouchDetection:
         assert counts["manual_touch_state_write_failed"] == 1
         assert "re-stamp" in capsys.readouterr().err
 
-    def _integration(self, pass_patch=None):
+    def _integration(self, pass_patch=None, rows_extra=()):
         attio = MagicMock()
         pb = MagicMock()
         dm_entry = _make_entry("e-dm", "r-dm", PipelineStage.DM1_SENT.value)
@@ -1333,6 +1384,7 @@ class TestManualTouchDetection:
                 "lastMessageDate": "2026-09-01T10:00:00Z",
                 "totalMessageCount": "1",
             },
+            *rows_extra,
         )
         pb.download_result_csv.return_value = csv_content
         name_map = {
@@ -1376,6 +1428,28 @@ class TestManualTouchDetection:
         assert result["manual_touch_pass_crashed"] == 1
         assert result["manual_touch_failed"] == 0
         assert "manual-touch pass crashed" in capsys.readouterr().err
+
+    def test_malformed_row_counts_are_reported_at_end_of_phase(self, capsys):
+        result, _ = self._integration(rows_extra=[self._row(from_me="unknown"), self._row(name="")])
+        output = capsys.readouterr().out
+        assert result["manual_touch_unknown_direction"] == 1
+        assert result["manual_touch_missing_name"] == 1
+        assert "manual_touch_unknown_direction=1" in output
+        assert "manual_touch_missing_name=1" in output
+
+    def test_crash_report_does_not_claim_failed_fingerprints_were_saved(self, capsys):
+        def crash(**kwargs):
+            kwargs["counts"]["manual_touches_detected"] = 1
+            kwargs["counts"]["manual_touch_state_write_failed"] = 1
+            raise RuntimeError("later row failed")
+
+        result, _ = self._integration(pass_patch=patch(
+            "workflows.detect_responses._detect_manual_touches", side_effect=crash,
+        ))
+        output = capsys.readouterr().err
+        assert result["manual_touch_pass_crashed"] == 1
+        assert "fingerprint save failures: 1" in output
+        assert "fingerprints saved" not in output
 
     def test_registry_violation_halts_phase(self):
         from clients.attio_writer import UnauthorizedAttioWriteError
